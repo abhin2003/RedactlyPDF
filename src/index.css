@@ -55,6 +55,7 @@ html, body {
   -moz-osx-font-smoothing: grayscale;
   line-height: 1.5;
   overflow-x: hidden;
+  font-size: 12.8px;
 }
 
 a {
@@ -144,7 +145,7 @@ h1, h2, h3, h4, h5, h6 {
 .gap-8 { gap: 2rem; }
 
 .brand-logo {
-  height: 32px;
+  height: 64px;
   width: auto;
   object-fit: contain;
 }

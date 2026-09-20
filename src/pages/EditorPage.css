@@ -1,15 +1,16 @@
 .editor-page {
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  width: 100vw;
+  height: 125vh;
+  width: 125vw;
   background-color: var(--neutral-offwhite-alt);
   overflow: hidden;
+  zoom: 0.8;
 }
 
 /* Toolbar */
 .editor-toolbar {
-  height: 56px;
+  height: 3.5rem;
   background: var(--neutral-white);
   border-bottom: 1px solid rgba(0,0,0,0.05);
   display: flex;
@@ -132,7 +133,7 @@
 
 /* Left Sidebar */
 .sidebar-left {
-  width: 240px;
+  width: 15rem;
   background: var(--neutral-white);
   border-right: 1px solid rgba(0,0,0,0.05);
   display: flex;
@@ -468,7 +469,7 @@
 
 /* Right Sidebar */
 .sidebar-right {
-  width: 320px;
+  width: 20rem;
   background: var(--neutral-white);
   border-left: 1px solid rgba(0,0,0,0.05);
   display: flex;
@@ -644,7 +645,7 @@
 
 /* Bottom Bar */
 .editor-bottom-bar {
-  height: 32px;
+  height: 2rem;
   background: var(--neutral-white);
   border-top: 1px solid rgba(0,0,0,0.05);
   display: flex;

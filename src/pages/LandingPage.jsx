@@ -328,8 +328,7 @@ const LandingPage = () => {
               millions of documents securely in their own browsers.
             </p>
             <div className="cta-actions">
-              <button className="btn btn-primary-bright btn-large"><Shield size={16}/> START A PDF</button>
-              <button className="btn btn-outline-dark btn-large">READ THE PROTOCOL</button>
+              <Link to="/editor" className="btn btn-primary-bright btn-large"><Shield size={16}/> START A PDF</Link>
             </div>
           </div>
         </div>
@@ -339,7 +338,7 @@ const LandingPage = () => {
         <div className="container" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', width: '100%' }}>
           <div className="footer-left">
             <div className="brand-dark">
-              <img src="/logo-white.png" alt="Redactly Logo" style={{ height: '24px', marginRight: '8px' }} />
+              <img src="/logo-white.png" alt="Redactly Logo" style={{ height: '48px', marginRight: '8px' }} />
             </div>
             <p className="footer-desc" style={{ marginBottom: '1rem' }}>Client-Side Zero-Leak Cryptographic Protocol</p>
             <div className="footer-company-details" style={{ fontSize: '0.8rem', color: '#888', lineHeight: '1.5' }}>

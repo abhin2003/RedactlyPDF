@@ -55,20 +55,21 @@ const FaqPage = () => {
 
   return (
     <div className="landing-page">
-      <nav className="navbar container">
-        <Link to="/" className="brand" style={{ textDecoration: 'none' }}>
-          <img src="/logo.png" alt="Redactly Logo" className="brand-logo" />
-          <span className="brand-name">REDACTLY</span>
-        </Link>
-        <div className="nav-links">
-          <Link to="/">Home</Link>
-          <Link to="/editor">Editor</Link>
-        </div>
-        <div className="nav-actions">
-          <Link to="/editor" className="btn btn-primary-nav">Try REDACTLY</Link>
-        </div>
-        <button className="mobile-menu-btn"><Menu /></button>
-      </nav>
+      <div className="faq-header" style={{ backgroundColor: '#0a0a0a', position: 'relative', height: '80px' }}>
+        <nav className="navbar container">
+          <Link to="/" className="brand" style={{ textDecoration: 'none' }}>
+            <img src="/logo-white.png" alt="Redactly Logo" className="brand-logo" />
+          </Link>
+          <div className="nav-links">
+            <Link to="/">Home</Link>
+            <Link to="/editor">Editor</Link>
+          </div>
+          <div className="nav-actions">
+            <Link to="/editor" className="btn btn-primary-nav">Try REDACTLY</Link>
+          </div>
+          <button className="mobile-menu-btn"><Menu /></button>
+        </nav>
+      </div>
 
       <section className="faq-section" style={{ padding: '8rem 0 4rem', backgroundColor: '#f9f9f9', minHeight: '80vh' }}>
         <div className="container" style={{ maxWidth: '800px' }}>
@@ -127,7 +128,7 @@ const FaqPage = () => {
         <div className="container" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', width: '100%' }}>
           <div className="footer-left">
             <div className="brand-dark">
-              <img src="/logo.png" alt="Redactly Logo" style={{ height: '16px', marginRight: '8px', filter: 'grayscale(1) brightness(2)' }} /> REDACTLY
+              <img src="/logo-white.png" alt="Redactly Logo" style={{ height: '48px', marginRight: '8px' }} />
             </div>
             <p className="footer-desc" style={{ marginBottom: '1rem' }}>Client-Side Zero-Leak Cryptographic Protocol</p>
             <div className="footer-company-details" style={{ fontSize: '0.8rem', color: '#888', lineHeight: '1.5' }}>

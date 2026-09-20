@@ -35,7 +35,7 @@ const EditorPage = () => {
   const [documentTextItems, setDocumentTextItems] = useState([]);
   const [searchResults, setSearchResults] = useState([]);
   const [selectedMatchIds, setSelectedMatchIds] = useState(new Set());
-  const [zoomScale, setZoomScale] = useState(1.5);
+  const [zoomScale, setZoomScale] = useState(1.0);
   const [isExporting, setIsExporting] = useState(false);
   const fileInputRef = useRef(null);
 
@@ -247,7 +247,7 @@ const EditorPage = () => {
           <button className="icon-btn" onClick={() => setZoomScale(z => Math.max(0.5, z - 0.25))} title="Zoom Out"><ZoomOut size={18}/></button>
           <span className="zoom-level" style={{ minWidth: '40px', textAlign: 'center' }}>{Math.round(zoomScale * 100)}%</span>
           <button className="icon-btn" onClick={() => setZoomScale(z => Math.min(3.0, z + 0.25))} title="Zoom In"><ZoomIn size={18}/></button>
-          <button className="text-btn" onClick={() => setZoomScale(1.5)}>Fit Width</button>
+          <button className="text-btn" onClick={() => setZoomScale(1.0)}>Fit Width</button>
           <div className="divider"></div>
           <button className="icon-btn" onClick={handleUndo} disabled={historyIndex <= 0} title="Undo"><Undo size={18}/></button>
           <button className="icon-btn" onClick={handleRedo} disabled={historyIndex >= history.length - 1} title="Redo"><RotateCw size={18}/></button>
