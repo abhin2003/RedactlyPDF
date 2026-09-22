@@ -247,13 +247,45 @@
   flex: 1;
   overflow-y: auto;
   display: flex;
-  justify-content: center;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
   padding: 2rem;
+  background-color: #f8faf9;
+}
+
+.pdf-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  max-width: 850px;
+  background: white;
+  padding: 0.75rem 1.5rem;
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0, 50, 20, 0.05);
+  border: 1px solid rgba(0, 0, 0, 0.04);
+  margin-bottom: 2rem;
+  flex-shrink: 0;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.pdf-toolbar .toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.pdf-toolbar .ml-auto {
+  margin-left: auto;
 }
 
 .document-container {
   width: 100%;
-  max-width: 800px;
+  max-width: 850px;
+  display: flex;
+  justify-content: center;
 }
 
 .document-page {

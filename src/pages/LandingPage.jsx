@@ -1,46 +1,18 @@
 import React from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { Shield, Lock, Replace, Trash2, CheckCircle2, ChevronRight, Menu, Play, ArrowRight, Upload } from 'lucide-react';
-import { usePdfContext } from '../context/PdfContext';
+import { useAuth } from '../context/AuthContext';
 import './LandingPage.css';
 
 const LandingPage = () => {
   const navigate = useNavigate();
-  const { addDocument } = usePdfContext();
-  const fileInputRef = React.useRef(null);
+  const { user } = useAuth();
 
-  const handleFileChange = async (e) => {
-    const files = Array.from(e.target.files);
-    let added = false;
-    for (const file of files) {
-      if (file && file.type === 'application/pdf') {
-        const buffer = await file.arrayBuffer();
-        addDocument(file.name, buffer);
-        added = true;
-      }
-    }
-    if (added) {
-      navigate('/editor');
+  const handleStart = () => {
+    if (user) {
+      navigate('/projects');
     } else {
-      alert("Please upload at least one PDF file.");
-    }
-  };
-
-  const handleDrop = async (e) => {
-    e.preventDefault();
-    const files = Array.from(e.dataTransfer.files);
-    let added = false;
-    for (const file of files) {
-      if (file && file.type === 'application/pdf') {
-        const buffer = await file.arrayBuffer();
-        addDocument(file.name, buffer);
-        added = true;
-      }
-    }
-    if (added) {
-      navigate('/editor');
-    } else {
-      alert("Please drop at least one PDF file.");
+      navigate('/login');
     }
   };
 
@@ -60,12 +32,12 @@ const LandingPage = () => {
           <Link to="/faq">FAQ</Link>
         </div>
         <div className="nav-actions">
-          <Link to="/editor" className="btn btn-primary-nav">Try REDACTLY</Link>
+          <button onClick={handleStart} className="btn btn-primary-nav">Try REDACTLY</button>
         </div>
         <button className="mobile-menu-btn"><Menu /></button>
       </nav>
 
-      <section className="hero" onDrop={handleDrop} onDragOver={handleDragOver}>
+      <section className="hero">
         <div className="hero-background"></div>
         <div className="hero-content container">
           <div className="hero-pill">
@@ -78,19 +50,11 @@ const LandingPage = () => {
             SOVEREIGN CLIENT-SIDE ZERO-TRUST WASM ENGINES.
           </p>
           <div className="hero-cta-group">
-            <input 
-              type="file" 
-              accept=".pdf" 
-              multiple
-              ref={fileInputRef} 
-              style={{ display: 'none' }} 
-              onChange={handleFileChange} 
-            />
             <button 
               className="btn btn-dark-cta btn-large" 
-              onClick={() => fileInputRef.current?.click()}
+              onClick={handleStart}
             >
-              <Upload size={16} className="mr-2" /> DROP OR SELECT PDF
+              START PROJECT
             </button>
             <button 
               className="btn btn-outline-light btn-large"
@@ -339,7 +303,7 @@ const LandingPage = () => {
               millions of documents securely in their own browsers.
             </p>
             <div className="cta-actions">
-              <Link to="/editor" className="btn btn-primary-bright btn-large"><Shield size={16}/> START A PDF</Link>
+              <Link to="/login" className="btn btn-primary-bright btn-large"><Shield size={16}/> START A PROJECT</Link>
             </div>
           </div>
         </div>

@@ -1,22 +1,32 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useParams, useNavigate } from 'react-router-dom';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, rgb } from 'pdf-lib';
 import { usePdfContext } from '../context/PdfContext';
 import PageThumbnail from '../components/PageThumbnail';
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
-
+import { projectService } from '../services/projectService';
+import { ruleService } from '../services/ruleService';
 import { 
   Shield, Search, EyeOff, Lock, Replace, Trash2, ChevronLeft, ChevronRight, 
-  ZoomIn, ZoomOut, Redo, Undo, Menu, Upload, Plus, Download, X
+  ZoomIn, ZoomOut, Redo, Undo, Menu, Upload, Plus, Download, X, ArrowLeft, Save, Edit2
 } from 'lucide-react';
 import './EditorPage.css';
 
-const EditorWorkspace = ({ document: doc }) => {
+pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+
+const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }) => {
   const { documents, updateDocumentBuffer } = usePdfContext();
-  const [activeTab, setActiveTab] = useState('redact');
-  const [pdfFile, setPdfFile] = useState(doc.buffer);
+  const [pdfFile, setPdfFile] = useState(doc ? doc.buffer : null);
+  const [editingRuleId, setEditingRuleId] = useState(null);
+  const [editingRuleQuery, setEditingRuleQuery] = useState('');
+  const [savedRuleIds, setSavedRuleIds] = useState(new Set());
+  useEffect(() => {
+    setPdfFile(doc ? doc.buffer : null);
+    setDocumentTextItems([]);
+    setSearchResults([]);
+    setSelectedMatchIds(new Set());
+    setActivePage(1);
+  }, [doc]);
   
   const [pdfDocument, setPdfDocument] = useState(null);
   const [totalPages, setTotalPages] = useState(0);
@@ -24,11 +34,15 @@ const EditorWorkspace = ({ document: doc }) => {
   const canvasRef = useRef(null);
 
   const [searchQuery, setSearchQuery] = useState('');
+  const [activeTab, setActiveTab] = useState('redact');
+  
   const [documentTextItems, setDocumentTextItems] = useState([]);
   const [searchResults, setSearchResults] = useState([]);
   const [selectedMatchIds, setSelectedMatchIds] = useState(new Set());
   const [zoomScale, setZoomScale] = useState(1.0);
   const [isExporting, setIsExporting] = useState(false);
+
+
 
   const [history, setHistory] = useState([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
@@ -41,7 +55,7 @@ const EditorWorkspace = ({ document: doc }) => {
   }, [pdfFile, history.length]);
 
   const handleUndo = () => {
-    if (historyIndex > 0) {
+    if (historyIndex > 0 && doc) {
       const newIndex = historyIndex - 1;
       setHistoryIndex(newIndex);
       setPdfFile(history[newIndex]);
@@ -50,7 +64,7 @@ const EditorWorkspace = ({ document: doc }) => {
   };
 
   const handleRedo = () => {
-    if (historyIndex < history.length - 1) {
+    if (historyIndex < history.length - 1 && doc) {
       const newIndex = historyIndex + 1;
       setHistoryIndex(newIndex);
       setPdfFile(history[newIndex]);
@@ -58,7 +72,7 @@ const EditorWorkspace = ({ document: doc }) => {
     }
   };
 
-  const handleApplyRedactions = async (matchesToProtect, targetBuffer = pdfFile, targetDocId = doc.id) => {
+  const handleApplyRedactions = async (matchesToProtect, targetBuffer = pdfFile, targetDocId = doc?.id) => {
     if (!targetBuffer || matchesToProtect.length === 0) return;
     
     setIsExporting(true);
@@ -69,10 +83,12 @@ const EditorWorkspace = ({ document: doc }) => {
       for (const match of matchesToProtect) {
         const pageIdx = match.pageNumber - 1;
         const page = pages[pageIdx];
+        const action = match.rule ? match.rule.action : activeTab;
         
         const baseHeight = match.height || match.transform[3] || 12;
         
-        const queryLower = searchQuery.toLowerCase();
+        const queryText = match.rule ? match.rule.query : searchQuery;
+        const queryLower = queryText.toLowerCase();
         const strLower = match.str.toLowerCase();
         const idx = strLower.indexOf(queryLower);
         
@@ -106,14 +122,14 @@ const EditorWorkspace = ({ document: doc }) => {
         const width = estimatedWidth + (paddingX * 2);
         const height = baseHeight * 1.4;
 
-        if (activeTab === 'redact') {
+        if (action === 'redact') {
           page.drawRectangle({ x, y, width, height, color: rgb(0, 0, 0) });
-        } else if (activeTab === 'mask') {
+        } else if (action === 'mask') {
           page.drawRectangle({ x, y, width, height, color: rgb(0.5, 0.9, 0.5), opacity: 0.8 });
-        } else if (activeTab === 'replace') {
+        } else if (action === 'replace') {
           page.drawRectangle({ x, y, width, height, color: rgb(1, 1, 1) });
           page.drawText("[SYNTHETIC]", { x: x + 2, y: y + (height * 0.2), size: baseHeight * 0.8, color: rgb(0, 0, 0) });
-        } else if (activeTab === 'remove') {
+        } else if (action === 'remove') {
           page.drawRectangle({ x, y, width, height, color: rgb(1, 1, 1) });
         }
       }
@@ -139,15 +155,76 @@ const EditorWorkspace = ({ document: doc }) => {
     }
   };
 
-  const handleApplyToAllPdfs = async () => {
+  const handleApplySavedRules = async () => {
+    const savedMatches = searchResults.filter(r => r.rule);
+    if (savedMatches.length > 0) {
+      await handleApplyRedactions(savedMatches);
+    } else {
+      alert("No matches found for the saved rules in this document.");
+    }
+  };
+
+  const handleDeleteRule = async (ruleId) => {
+    await ruleService.deleteRule(projectId, ruleId);
+    reloadRules();
+  };
+
+  const handleSaveRuleEdit = async (ruleId, newQuery) => {
+    if (newQuery && newQuery.trim()) {
+      await ruleService.updateRule(projectId, ruleId, { query: newQuery.trim() });
+      reloadRules();
+      setSavedRuleIds(prev => {
+        const next = new Set(prev);
+        next.add(ruleId);
+        return next;
+      });
+    }
+  };
+
+  const saveQueryAsRuleIfNotExists = async () => {
     if (!searchQuery.trim()) return;
+    const queryLower = searchQuery.trim().toLowerCase();
+    const ruleExists = projectRules.some(r => r.query.toLowerCase() === queryLower);
+    if (!ruleExists) {
+      await ruleService.addRule(projectId, { query: searchQuery.trim(), action: activeTab });
+      reloadRules();
+    }
+  };
+
+  const handleApplyToAllPdfs = async () => {
+    if (projectRules.length === 0 && !searchQuery.trim()) return;
+    
+    // Save the current search query as a rule if it doesn't exist
+    await saveQueryAsRuleIfNotExists();
+    
     setIsExporting(true);
     
     try {
+      const getMatchesForItems = (items) => {
+        let matches = [];
+        projectRules.forEach(rule => {
+          const query = rule.query.toLowerCase();
+          const ruleMatches = items
+            .filter(item => item.str.toLowerCase().includes(query))
+            .map(m => ({ ...m, rule, matchId: `rule-${rule.id}-${m.id}` }));
+          matches = matches.concat(ruleMatches);
+        });
+        
+        if (searchQuery.trim()) {
+          const query = searchQuery.toLowerCase();
+          const searchMatches = items
+            .filter(item => item.str.toLowerCase().includes(query))
+            .map(m => ({ ...m, matchId: `search-${m.id}` }));
+          matches = matches.concat(searchMatches);
+        }
+        return matches;
+      };
+
       for (const currentDoc of documents) {
-        if (currentDoc.id === doc.id) {
-          if (searchResults.length > 0) {
-            await handleApplyRedactions(searchResults, currentDoc.buffer, currentDoc.id);
+        if (currentDoc.id === doc?.id) {
+          const matches = getMatchesForItems(documentTextItems);
+          if (matches.length > 0) {
+            await handleApplyRedactions(matches, currentDoc.buffer, currentDoc.id);
           }
           continue;
         }
@@ -167,8 +244,7 @@ const EditorWorkspace = ({ document: doc }) => {
           allTextItems = allTextItems.concat(pageItems);
         }
         
-        const query = searchQuery.toLowerCase();
-        const matches = allTextItems.filter(item => item.str.toLowerCase().includes(query));
+        const matches = getMatchesForItems(allTextItems);
         
         if (matches.length > 0) {
           await handleApplyRedactions(matches, currentDoc.buffer, currentDoc.id);
@@ -183,7 +259,7 @@ const EditorWorkspace = ({ document: doc }) => {
   };
 
   const handleDownload = () => {
-    if (!pdfFile) return;
+    if (!pdfFile || !doc) return;
     const blob = new Blob([pdfFile], { type: 'application/pdf' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -225,16 +301,19 @@ const EditorWorkspace = ({ document: doc }) => {
   }, [pdfFile]);
 
   useEffect(() => {
-    if (!searchQuery.trim()) {
-      setSearchResults([]);
-      setSelectedMatchIds(new Set());
-      return;
+    let results = [];
+    
+    if (searchQuery.trim()) {
+      // If actively searching, only show search matches
+      const query = searchQuery.toLowerCase();
+      results = documentTextItems
+        .filter(item => item.str.toLowerCase().includes(query))
+        .map(m => ({ ...m, matchId: `search-${m.id}` }));
     }
-    const query = searchQuery.toLowerCase();
-    const results = documentTextItems.filter(item => item.str.toLowerCase().includes(query));
+    
     setSearchResults(results);
-    setSelectedMatchIds(new Set(results.map(r => r.id)));
-  }, [searchQuery, documentTextItems]);
+    setSelectedMatchIds(new Set(results.map(r => r.matchId)));
+  }, [documentTextItems, searchQuery]);
 
   const renderHighlightedText = (text, query, isSelected) => {
     if (!query) return text;
@@ -282,46 +361,44 @@ const EditorWorkspace = ({ document: doc }) => {
       {/* Top Toolbar */}
       <header className="editor-toolbar">
         <div className="toolbar-left">
-          <Link to="/" className="brand">
-            <img src="/logo-dark.png" alt="Redactly Logo" className="brand-logo" />
+          <Link to="/projects" className="brand" title="Back to Projects" style={{ display: 'flex', alignItems: 'center', textDecoration: 'none' }}>
+            <ArrowLeft size={18} className="mr-2" style={{ color: 'var(--neutral-dark)' }} />
           </Link>
           <div className="doc-info">
             <span className="doc-icon">📄</span>
             <div className="doc-meta">
-              <div className="doc-title-bar">{doc.name || 'No document loaded'}</div>
+              <div className="doc-title-bar">{doc ? doc.name : 'No document loaded'}</div>
               <div className="doc-stats">{totalPages || 0} Pages • Client-side WASM Memory</div>
             </div>
             <div className="badge-isolated">
               <span className="dot-green"></span> ISOLATED
             </div>
           </div>
+          <button className="btn btn-primary-dark ml-4" disabled={!doc} onClick={handleDownload} style={{ padding: '0.4rem 1rem', fontSize: '0.75rem', fontWeight: 'bold' }}>EXPORT REDACTED PDF</button>
         </div>
 
         <div className="toolbar-center">
-          <button className="icon-btn" onClick={() => setActivePage(p => Math.max(1, p - 1))} disabled={activePage <= 1}><ChevronLeft size={18}/></button>
-          <span className="page-indicator">{activePage} / {totalPages || 1}</span>
-          <button className="icon-btn" onClick={() => setActivePage(p => Math.min(totalPages, p + 1))} disabled={activePage >= totalPages || !totalPages}><ChevronRight size={18}/></button>
+          <button className="icon-btn" onClick={() => setActivePage(p => Math.max(1, p - 1))} disabled={activePage <= 1 || !doc}><ChevronLeft size={16}/></button>
+          <span className="page-indicator" style={{ minWidth: '40px', textAlign: 'center' }}>{doc ? `${activePage} / ${totalPages}` : '-'}</span>
+          <button className="icon-btn" onClick={() => setActivePage(p => Math.min(totalPages, p + 1))} disabled={activePage >= totalPages || !doc}><ChevronRight size={16}/></button>
+          
           <div className="divider"></div>
-          <button className="icon-btn" onClick={() => setZoomScale(z => Math.max(0.5, z - 0.25))} title="Zoom Out"><ZoomOut size={18}/></button>
+          
+          <button className="icon-btn" disabled={!doc} onClick={() => setZoomScale(s => Math.max(0.5, s - 0.1))}><ZoomOut size={16}/></button>
           <span className="zoom-level" style={{ minWidth: '40px', textAlign: 'center' }}>{Math.round(zoomScale * 100)}%</span>
-          <button className="icon-btn" onClick={() => setZoomScale(z => Math.min(3.0, z + 0.25))} title="Zoom In"><ZoomIn size={18}/></button>
-          <button className="text-btn" onClick={() => setZoomScale(1.0)}>Fit Width</button>
+          <button className="icon-btn" disabled={!doc} onClick={() => setZoomScale(s => Math.min(3, s + 0.1))}><ZoomIn size={16}/></button>
+          <button className="text-btn" disabled={!doc}>Fit Width</button>
+          
           <div className="divider"></div>
-          <button className="icon-btn" onClick={handleUndo} disabled={historyIndex <= 0} title="Undo"><Undo size={18}/></button>
-          <button className="icon-btn" onClick={handleRedo} disabled={historyIndex >= history.length - 1} title="Redo"><Redo size={18}/></button>
+          
+          <button className="icon-btn" disabled={historyIndex <= 0 || !doc} onClick={handleUndo} title="Undo"><Undo size={16}/></button>
+          <button className="icon-btn" disabled={historyIndex >= history.length - 1 || !doc} onClick={handleRedo} title="Redo"><Redo size={16}/></button>
         </div>
 
         <div className="toolbar-right">
           <div className="pipeline-status-badge">
             <Shield size={14}/> ZERO-LEAK PIPELINE
           </div>
-          <button 
-            className="btn btn-primary btn-export" 
-            onClick={handleDownload}
-            disabled={!pdfFile}
-          >
-            EXPORT REDACTED PDF
-          </button>
         </div>
       </header>
 
@@ -333,7 +410,7 @@ const EditorWorkspace = ({ document: doc }) => {
             <span className="sidebar-count">{totalPages || 0} PAGES</span>
           </div>
           
-          <div className="pages-list" style={{ overflowY: 'auto', flex: 1 }}>
+          <div className="pages-list" style={{ overflowY: 'auto', flex: 1, maxHeight: '50%' }}>
             {pdfDocument && Array.from({ length: totalPages }, (_, i) => i + 1).map(pageNum => (
               <PageThumbnail 
                 key={pageNum}
@@ -344,26 +421,127 @@ const EditorWorkspace = ({ document: doc }) => {
               />
             ))}
           </div>
-          <div className="sidebar-footer">
-            <span>Total Purged Items:</span>
-            <span className="font-bold">0 Elements</span>
+
+          <div className="sidebar-header" style={{ borderTop: '1px solid rgba(0,0,0,0.05)' }}>
+            <span className="sidebar-title"><Shield size={12} className="inline mr-1" /> SAVED RULES</span>
+            <span className="sidebar-count">{projectRules.length} RULES</span>
+          </div>
+          
+            <div className="rules-list" style={{ flex: 1, overflowY: 'auto', padding: '1rem', background: '#fafafa' }}>
+              {projectRules.map(rule => (
+                <div 
+                  key={rule.id} 
+                  onClick={(e) => {
+                    if (e.target.tagName !== 'INPUT' && !e.target.closest('button')) {
+                      setSearchQuery(rule.query);
+                      setActiveTab(rule.action);
+                    }
+                  }}
+                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', padding: '0.5rem', background: savedRuleIds.has(rule.id) ? 'rgba(15, 157, 88, 0.1)' : 'white', borderRadius: '4px', border: savedRuleIds.has(rule.id) ? '1px solid var(--green-primary)' : '1px solid rgba(0,0,0,0.1)', transition: 'all 0.3s ease', cursor: 'pointer' }}
+                >
+                  <div style={{ flex: 1, marginRight: '0.5rem' }}>
+                    <input 
+                      type="text" 
+                      defaultValue={rule.query}
+                      onBlur={(e) => handleSaveRuleEdit(rule.id, e.target.value)}
+                      onKeyDown={(e) => { if (e.key === 'Enter') handleSaveRuleEdit(rule.id, e.target.value); }}
+                      onChange={() => {
+                        if (savedRuleIds.has(rule.id)) {
+                          setSavedRuleIds(prev => {
+                            const next = new Set(prev);
+                            next.delete(rule.id);
+                            return next;
+                          });
+                        }
+                      }}
+                      style={{ fontSize: '0.85rem', width: '100%', border: 'none', background: 'transparent', outline: 'none', fontWeight: 'bold', padding: 0 }}
+                    />
+                    <div style={{ fontSize: '0.7rem', color: '#666', textTransform: 'uppercase' }}>{rule.action}</div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
+                    <button 
+                      className="icon-btn-subtle" 
+                      onClick={(e) => {
+                        const input = e.currentTarget.parentElement.previousSibling.querySelector('input');
+                        if (input) handleSaveRuleEdit(rule.id, input.value);
+                      }} 
+                      style={{ color: savedRuleIds.has(rule.id) ? 'var(--green-primary)' : '#666', background: 'none', border: 'none', cursor: 'pointer', padding: '4px', transition: 'color 0.3s ease' }} 
+                      title={savedRuleIds.has(rule.id) ? "Saved!" : "Save Changes"}
+                    >
+                      <Save size={14} fill={savedRuleIds.has(rule.id) ? 'white' : 'none'} />
+                    </button>
+                    <button className="icon-btn-subtle" onClick={() => handleDeleteRule(rule.id)} style={{ color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer', padding: '4px' }} title="Delete Rule"><Trash2 size={14}/></button>
+                  </div>
+                </div>
+              ))}
+            
+            {projectRules.length === 0 && (
+              <div style={{ fontSize: '0.75rem', color: '#888', textAlign: 'center', margin: '1rem 0' }}>
+                No rules saved yet.
+              </div>
+            )}
+            
+            <button 
+              className="btn btn-outline-dark" 
+              style={{ width: '100%', marginTop: '0.5rem', marginBottom: '0.5rem', fontWeight: 'bold', fontSize: '0.75rem' }}
+              disabled={!searchQuery.trim() || isExporting}
+              onClick={async () => {
+                await ruleService.addRule(projectId, { query: searchQuery.trim(), action: activeTab });
+                reloadRules();
+                setSearchQuery('');
+              }}
+            >
+              <Shield size={14} className="inline mr-2" /> SAVE CURRENT RULE
+            </button>
+            
+            {projectRules.length > 0 && (
+              <button 
+                className="btn btn-outline-dark" 
+                style={{ width: '100%', marginTop: '0.5rem', fontSize: '0.75rem' }}
+                onClick={handleApplySavedRules}
+                disabled={isExporting}
+              >
+                APPLY RULES TO THIS PDF
+              </button>
+            )}
+          </div>
+
+          <div className="sidebar-footer" style={{ padding: '0.75rem' }}>
+            <button 
+              className="btn btn-primary-bright" 
+              style={{ width: '100%', backgroundColor: 'var(--green-deep)', fontWeight: 'bold', fontSize: '0.9rem', padding: '0.6rem' }}
+              disabled={(projectRules.length === 0 && !searchQuery.trim()) || isExporting}
+              onClick={handleApplyToAllPdfs}
+            >
+              {isExporting ? "Processing..." : "APPLY"}
+            </button>
           </div>
         </aside>
 
         {/* Center Workspace */}
-        <main className="workspace-center" style={{ overflow: 'auto', backgroundColor: '#f5f5f5' }}>
-          <div className="document-container" style={{ minHeight: '100%', padding: '2rem', display: 'flex', justifyContent: 'center' }}>
-            <div className="pdf-canvas-wrapper" style={{ position: 'relative' }}>
-              <canvas 
-                ref={canvasRef} 
-                className="pdf-canvas" 
-                style={{ boxShadow: '0 8px 24px rgba(0,0,0,0.1)', background: 'white' }} 
-              />
-            </div>
+        <main className="workspace-center">
+
+          <div className="pdf-container">
+            {doc ? (
+              <div className="pdf-page-wrapper" style={{ transform: `scale(${zoomScale})`, transformOrigin: 'top center' }}>
+                <canvas ref={canvasRef} className="pdf-canvas shadow-lg"></canvas>
+              </div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#888' }}>
+                <p style={{ marginBottom: '1.5rem', fontSize: '1.1rem' }}>No document selected</p>
+                <button 
+                  className="btn btn-primary" 
+                  onClick={() => document.querySelector('.tab-add-btn')?.click()}
+                  style={{ padding: '0.75rem 1.5rem' }}
+                >
+                  <Upload size={18} className="inline mr-2" /> UPLOAD OR SELECT PDF
+                </button>
+              </div>
+            )}
           </div>
         </main>
 
-        {/* Right Sidebar - Protect */}
+        {/* Right Sidebar - Find Sensitive Data */}
         <aside className="sidebar-right" style={{ borderRight: '1px solid rgba(0,0,0,0.05)' }}>
           <div className="sidebar-header">
             <span className="sidebar-title"><span className="dot-green"></span> FIND SENSITIVE DATA</span>
@@ -389,7 +567,7 @@ const EditorWorkspace = ({ document: doc }) => {
             {searchResults.length > 0 && <span className="badge-green-solid">P{activePage}: {searchResults.filter(r => r.pageNumber === activePage).length} Matches</span>}
           </div>
 
-          <div className="protect-section flex-1">
+          <div className="protect-section flex-1" style={{ overflowY: 'auto' }}>
             {searchResults.length > 0 && (
               <div className="section-header">
                 <span className="section-label">DETECTION CONTEXT</span>
@@ -398,17 +576,17 @@ const EditorWorkspace = ({ document: doc }) => {
             )}
             
             {searchResults.map((result, idx) => {
-              const isSelected = selectedMatchIds.has(result.id);
+              const isSelected = selectedMatchIds.has(result.matchId);
               return (
                 <div 
-                  key={result.id} 
+                  key={result.matchId} 
                   className={`match-card ${isSelected ? 'active' : ''}`} 
                   onClick={() => {
                     setActivePage(result.pageNumber);
                     setSelectedMatchIds(prev => {
                       const next = new Set(prev);
-                      if (next.has(result.id)) next.delete(result.id);
-                      else next.add(result.id);
+                      if (next.has(result.matchId)) next.delete(result.matchId);
+                      else next.add(result.matchId);
                       return next;
                     });
                   }} 
@@ -416,20 +594,24 @@ const EditorWorkspace = ({ document: doc }) => {
                 >
                   <div className="match-card-header">
                     <span>📄 PAGE {result.pageNumber}</span>
-                    {isSelected ? <span className="badge-green-solid">SELECTED</span> : <span className="match-id">MATCH #{idx+1}</span>}
+                    <span className="badge-dark">{result.rule ? result.rule.action.toUpperCase() : activeTab.toUpperCase()}</span>
                   </div>
                   <div className="match-card-content">
-                    {renderHighlightedText(result.str, searchQuery, isSelected)}
+                    {renderHighlightedText(result.str, result.rule ? result.rule.query : searchQuery, isSelected)}
                   </div>
                 </div>
               );
             })}
 
             {searchResults.length === 0 && searchQuery && (
-              <div style={{ padding: '1rem', color: '#888', textAlign: 'center' }}>No matches found for "{searchQuery}".</div>
+              <div style={{ padding: '1rem', color: '#888', textAlign: 'center' }}>
+                No matches found for "{searchQuery}".
+              </div>
             )}
-            {!searchQuery && (
-              <div style={{ padding: '1rem', color: '#888', textAlign: 'center' }}>Enter text to search for sensitive entities.</div>
+            {!searchQuery && searchResults.length === 0 && (
+              <div style={{ padding: '1rem', color: '#888', textAlign: 'center' }}>
+                Enter text to search for sensitive entities.
+              </div>
             )}
           </div>
         </aside>
@@ -488,14 +670,20 @@ const EditorWorkspace = ({ document: doc }) => {
               <button 
                 className="btn btn-secondary-light footer-btn" 
                 disabled={selectedMatchIds.size === 0 || isExporting}
-                onClick={() => handleApplyRedactions(searchResults.filter(r => selectedMatchIds.has(r.id)))}
+                onClick={async () => {
+                  await saveQueryAsRuleIfNotExists();
+                  handleApplyRedactions(searchResults.filter(r => selectedMatchIds.has(r.matchId)));
+                }}
               >
                 {isExporting ? "Applying..." : <>Apply to Selected<br/>({selectedMatchIds.size})</>}
               </button>
               <button 
                 className="btn btn-primary footer-btn" 
                 disabled={searchResults.length === 0 || isExporting}
-                onClick={() => handleApplyRedactions(searchResults)}
+                onClick={async () => {
+                  await saveQueryAsRuleIfNotExists();
+                  handleApplyRedactions(searchResults);
+                }}
               >
                 {isExporting ? "Applying..." : <>Protect All {searchResults.length}<br/>Matches</>}
               </button>
@@ -504,7 +692,7 @@ const EditorWorkspace = ({ document: doc }) => {
             <button 
               className="btn btn-primary-bright footer-btn" 
               style={{ width: '100%', marginTop: '0.5rem', backgroundColor: 'var(--green-deep)' }}
-              disabled={!searchQuery || isExporting}
+              disabled={(projectRules.length === 0 && !searchQuery.trim()) || isExporting}
               onClick={handleApplyToAllPdfs}
             >
               {isExporting ? "Processing..." : "Apply to all PDFs"}
@@ -533,8 +721,42 @@ const EditorWorkspace = ({ document: doc }) => {
 };
 
 const EditorPage = () => {
-  const { documents, activeDocId, setActiveDocId, activeDocument, addDocument, removeDocument } = usePdfContext();
+  const { projectId } = useParams();
+  const navigate = useNavigate();
+  const [project, setProject] = useState(null);
+  const [projectRules, setProjectRules] = useState([]);
+
+  const { documents, activeDocId, setActiveDocId, activeDocument, addDocument, removeDocument, setDocuments } = usePdfContext();
   const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    loadProject();
+  }, [projectId]);
+
+  const loadProject = async () => {
+    const proj = await projectService.getProject(projectId);
+    if (!proj) {
+      navigate('/projects');
+      return;
+    }
+    setProject(proj);
+    await loadRules();
+  };
+
+  const loadRules = async () => {
+    const rules = await ruleService.getRules(projectId);
+    setProjectRules(rules);
+  };
+
+  // Sync project stats when files or rules change
+  useEffect(() => {
+    if (project) {
+      projectService.updateProjectStats(projectId, {
+        filesCount: documents.length,
+        rulesCount: projectRules.length
+      });
+    }
+  }, [documents.length, projectRules.length, projectId, project]);
 
   const handleAddFileChange = async (e) => {
     const files = Array.from(e.target.files);
@@ -562,12 +784,32 @@ const EditorPage = () => {
     });
   };
 
+  const handleRemoveAll = () => {
+    if (window.confirm("Are you sure you want to remove all open PDFs from this project?")) {
+      setDocuments([]);
+      setActiveDocId(null);
+    }
+  };
+
+  if (!project) return <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh' }}>Loading project...</div>;
+
   return (
     <div className="editor-page" style={{ height: '125vh', width: '125vw', display: 'flex', flexDirection: 'column', backgroundColor: 'var(--neutral-offwhite-alt)', overflow: 'hidden', zoom: 0.8 }}>
       
+      {/* Project Header */}
+      <div style={{ width: '100%', textAlign: 'center', padding: '0.4rem', backgroundColor: 'white', borderBottom: '1px solid rgba(0,0,0,0.05)', fontWeight: 'bold', color: 'var(--gray-800)', fontSize: '0.95rem' }}>
+        {project.name}
+      </div>
+
       {/* Tabs Bar */}
       <div className="editor-tabs-bar">
         <div className="tabs-container">
+          <Link to="/projects" className="project-title-tab" style={{ padding: '0 1rem', borderRight: '1px solid rgba(255,255,255,0.1)', display: 'flex', alignItems: 'center', gap: '0.5rem', textDecoration: 'none' }}>
+            <div style={{ width: '18px', height: '18px', overflow: 'hidden', display: 'flex', justifyContent: 'center' }}>
+              <img src="/logo-white.png" alt="Redactly Icon" style={{ width: '130%', height: 'auto', marginTop: '-5%' }} />
+            </div>
+            <span style={{ color: 'var(--green-primary)', fontWeight: '900', letterSpacing: '-0.5px' }}>REDACTLY</span>
+          </Link>
           {documents.map(doc => (
             <div 
               key={doc.id} 
@@ -604,10 +846,18 @@ const EditorPage = () => {
           />
         </div>
 
-        <div className="tabs-actions">
+        <div className="tabs-actions" style={{ display: 'flex', gap: '0.5rem', marginRight: '1rem' }}>
           <button 
             className="btn btn-outline-dark btn-sm" 
-            style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginRight: '1rem' }}
+            style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', color: '#ef4444', borderColor: 'rgba(239, 68, 68, 0.5)' }}
+            onClick={handleRemoveAll}
+            disabled={documents.length === 0}
+          >
+            <Trash2 size={14}/> REMOVE ALL
+          </button>
+          <button 
+            className="btn btn-primary btn-sm" 
+            style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', backgroundColor: 'var(--green-primary)', color: 'white', border: 'none' }}
             onClick={handleDownloadAll}
             disabled={documents.length === 0}
           >
@@ -616,22 +866,12 @@ const EditorPage = () => {
         </div>
       </div>
 
-      {activeDocument ? (
-        <EditorWorkspace key={activeDocument.id} document={activeDocument} />
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', flex: 1 }}>
-          <div style={{ color: '#888', fontSize: '1.2rem', marginBottom: '1.5rem' }}>
-            No documents loaded
-          </div>
-          <button 
-            className="btn btn-primary btn-large" 
-            style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '1rem 2rem' }}
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <Upload size={18} /> DROP OR SELECT PDF
-          </button>
-        </div>
-      )}
+      <EditorWorkspace 
+        document={activeDocument || null} 
+        projectId={projectId}
+        projectRules={projectRules}
+        reloadRules={loadRules}
+      />
     </div>
   );
 };
