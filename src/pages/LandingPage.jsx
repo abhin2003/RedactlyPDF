@@ -6,31 +6,41 @@ import './LandingPage.css';
 
 const LandingPage = () => {
   const navigate = useNavigate();
-  const { setPdfFile, setPdfFileName } = usePdfContext();
+  const { addDocument } = usePdfContext();
   const fileInputRef = React.useRef(null);
 
   const handleFileChange = async (e) => {
-    const file = e.target.files[0];
-    if (file && file.type === 'application/pdf') {
-      const buffer = await file.arrayBuffer();
-      setPdfFile(buffer);
-      setPdfFileName(file.name);
+    const files = Array.from(e.target.files);
+    let added = false;
+    for (const file of files) {
+      if (file && file.type === 'application/pdf') {
+        const buffer = await file.arrayBuffer();
+        addDocument(file.name, buffer);
+        added = true;
+      }
+    }
+    if (added) {
       navigate('/editor');
-    } else if (file) {
-      alert("Please upload a PDF file.");
+    } else {
+      alert("Please upload at least one PDF file.");
     }
   };
 
   const handleDrop = async (e) => {
     e.preventDefault();
-    const file = e.dataTransfer.files[0];
-    if (file && file.type === 'application/pdf') {
-      const buffer = await file.arrayBuffer();
-      setPdfFile(buffer);
-      setPdfFileName(file.name);
+    const files = Array.from(e.dataTransfer.files);
+    let added = false;
+    for (const file of files) {
+      if (file && file.type === 'application/pdf') {
+        const buffer = await file.arrayBuffer();
+        addDocument(file.name, buffer);
+        added = true;
+      }
+    }
+    if (added) {
       navigate('/editor');
-    } else if (file) {
-      alert("Please drop a PDF file.");
+    } else {
+      alert("Please drop at least one PDF file.");
     }
   };
 
@@ -71,6 +81,7 @@ const LandingPage = () => {
             <input 
               type="file" 
               accept=".pdf" 
+              multiple
               ref={fileInputRef} 
               style={{ display: 'none' }} 
               onChange={handleFileChange} 
