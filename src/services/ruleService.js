@@ -38,5 +38,29 @@ export const ruleService = {
     const updated = rules.map(r => r.id === ruleId ? { ...r, ...updates } : r);
     localStorage.setItem(getRulesKey(projectId), JSON.stringify(updated));
     return true;
+  },
+
+  getAllRules: async () => {
+    await delay();
+    const all = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith('redactly_rules_')) {
+        try {
+          const rules = JSON.parse(localStorage.getItem(key) || '[]');
+          all.push(...rules);
+        } catch {}
+      }
+    }
+    const unique = [];
+    const seen = new Set();
+    for (const r of all) {
+      const sig = `${r.type || 'text'}-${(r.query || '').toLowerCase()}-${r.action}`;
+      if (!seen.has(sig)) {
+        seen.add(sig);
+        unique.push(r);
+      }
+    }
+    return unique;
   }
 };

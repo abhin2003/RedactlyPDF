@@ -218,6 +218,29 @@ h1, h2, h3, h4, h5, h6 {
   transform: none !important;
 }
 
+.btn-outline-dark {
+  background-color: #ffffff;
+  color: var(--neutral-dark, #1e293b);
+  border: 1px solid #cbd5e1;
+}
+
+.btn-outline-dark:hover:not(:disabled) {
+  background-color: #f1f5f9;
+  border-color: #94a3b8;
+  color: #0f172a;
+}
+
+.btn-sm {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.78rem;
+}
+
+.btn-xs {
+  padding: 0.2rem 0.5rem;
+  font-size: 0.68rem;
+  border-radius: var(--radius-sm, 4px);
+}
+
 /* Custom Scrollbar */
 ::-webkit-scrollbar {
   width: 8px;

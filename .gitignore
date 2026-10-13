@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Private test assets
+test_files/
+public/test_files/
+test_pipeline.js

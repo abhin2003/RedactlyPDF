@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Link, useParams, useNavigate } from 'react-router-dom';
 import * as pdfjsLib from 'pdfjs-dist';
 import { PDFDocument, rgb } from 'pdf-lib';
@@ -8,8 +8,10 @@ import { projectService } from '../services/projectService';
 import { ruleService } from '../services/ruleService';
 import { 
   Shield, Search, EyeOff, Lock, Replace, Trash2, ChevronLeft, ChevronRight, 
-  ZoomIn, ZoomOut, Redo, Undo, Menu, Upload, Plus, Download, X, ArrowLeft, Save, Edit2
+  ZoomIn, ZoomOut, Redo, Undo, Menu, Upload, Plus, Download, X, ArrowLeft, Save, Edit2, RefreshCw, Image as ImageIcon
 } from 'lucide-react';
+import { getEmbeddingFromImageData, getEmbeddingFromImageElement, cosineSimilarity } from '../services/mlImageUtils';
+import { detectImagesOnCanvas, findTemplateMatch } from '../services/imageDetectionUtils';
 import './EditorPage.css';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
@@ -20,12 +22,16 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
   const [editingRuleId, setEditingRuleId] = useState(null);
   const [editingRuleQuery, setEditingRuleQuery] = useState('');
   const [savedRuleIds, setSavedRuleIds] = useState(new Set());
+  const [availableOtherRules, setAvailableOtherRules] = useState([]);
+
   useEffect(() => {
     setPdfFile(doc ? doc.buffer : null);
     setDocumentTextItems([]);
     setSearchResults([]);
     setSelectedMatchIds(new Set());
     setActivePage(1);
+    setHistory(doc ? [doc.buffer] : []);
+    setHistoryIndex(doc ? 0 : -1);
   }, [doc]);
   
   const [pdfDocument, setPdfDocument] = useState(null);
@@ -36,11 +42,279 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
   const [searchQuery, setSearchQuery] = useState('');
   const [activeTab, setActiveTab] = useState('redact');
   
+  const [referenceImages, setReferenceImages] = useState([]);
+  const [selectedRefImageId, setSelectedRefImageId] = useState(null);
+  const referenceImagesRef = useRef(referenceImages);
+  const isApplyingRedactionRef = useRef(false);
+  const scannedDocIdRef = useRef(null);
+
+  useEffect(() => {
+    referenceImagesRef.current = referenceImages;
+  }, [referenceImages]);
+
+  useEffect(() => {
+    if (!projectRules || projectRules.length === 0) return;
+    const imageRules = projectRules.filter(r => r.type === 'image' && r.preview);
+    if (imageRules.length === 0) return;
+
+    setReferenceImages(prev => {
+      const existingIds = new Set(prev.map(p => p.id));
+      const existingNames = new Set(prev.map(p => p.name));
+      const toAdd = [];
+      for (const r of imageRules) {
+        if (!existingIds.has(r.refImageId) && !existingNames.has(r.query)) {
+          const img = new Image();
+          img.src = r.preview;
+          toAdd.push({
+            id: r.refImageId || `ref-${r.id}`,
+            name: r.query,
+            preview: r.preview,
+            hash: r.hash || null,
+            ruleId: r.id,
+            element: img
+          });
+        }
+      }
+      if (toAdd.length === 0) return prev;
+      const updated = [...prev, ...toAdd];
+      referenceImagesRef.current = updated;
+      if (!selectedRefImageId) {
+        setSelectedRefImageId(updated[0].id);
+      }
+      return updated;
+    });
+  }, [projectRules]);
+
+  const refImageInputRef = useRef(null);
+
   const [documentTextItems, setDocumentTextItems] = useState([]);
   const [searchResults, setSearchResults] = useState([]);
   const [selectedMatchIds, setSelectedMatchIds] = useState(new Set());
   const [zoomScale, setZoomScale] = useState(1.0);
   const [isExporting, setIsExporting] = useState(false);
+  const [isExtractingML, setIsExtractingML] = useState(false);
+
+  const refImageMatchesCounts = useMemo(() => {
+    const counts = {};
+    const pdfImages = documentTextItems.filter(item => item.type === 'image' && item.hash);
+    const templateMatches = documentTextItems.filter(item => item.type === 'image-match');
+
+    referenceImages.forEach(refImg => {
+      let count = templateMatches.filter(item => item.refImageId === refImg.id || (refImg.name && item.refImageName === refImg.name)).length;
+      if (refImg.hash) {
+        count += pdfImages.filter(item => cosineSimilarity(item.hash, refImg.hash) > 0.80).length;
+      }
+      counts[refImg.id] = count;
+    });
+    return counts;
+  }, [documentTextItems, referenceImages]);
+
+  useEffect(() => {
+    if (projectRules.length === 0) {
+      ruleService.getAllRules().then(rules => {
+        setAvailableOtherRules(rules);
+      });
+    } else {
+      setAvailableOtherRules([]);
+    }
+  }, [projectRules]);
+
+  const handleImportOtherRules = async () => {
+    for (const r of availableOtherRules) {
+      await ruleService.addRule(projectId, {
+        query: r.query,
+        action: r.action,
+        type: r.type,
+        refImageId: r.refImageId,
+        preview: r.preview,
+        hash: r.hash
+      });
+    }
+    await reloadRules();
+  };
+
+  const scanDocumentForReferenceImages = async (pdfDoc, refImagesToScan) => {
+    if (!pdfDoc || !refImagesToScan || refImagesToScan.length === 0) return [];
+    setIsExtractingML(true);
+    const newMatches = [];
+    try {
+      for (const refImg of refImagesToScan) {
+        let imgElem = refImg.element;
+        if (!imgElem || !imgElem.complete || (imgElem.naturalWidth || 0) === 0) {
+          const src = (imgElem && imgElem.src) || refImg.preview;
+          if (src) {
+            try {
+              imgElem = await new Promise((resolve, reject) => {
+                const im = new Image();
+                im.onload = () => resolve(im);
+                im.onerror = reject;
+                im.src = src;
+              });
+              refImg.element = imgElem;
+            } catch (e) {
+              console.warn("Failed loading preview image element", e);
+              continue;
+            }
+          }
+        }
+        if (!imgElem || (imgElem.naturalWidth || 0) === 0) continue;
+
+        for (let i = 1; i <= pdfDoc.numPages; i++) {
+          await new Promise(r => setTimeout(r, 0));
+          const page = await pdfDoc.getPage(i);
+          const viewport = page.getViewport({ scale: 1.0 });
+          const offscreenCanvas = document.createElement('canvas');
+          offscreenCanvas.width = viewport.width;
+          offscreenCanvas.height = viewport.height;
+          const ctx = offscreenCanvas.getContext('2d');
+          await page.render({ canvasContext: ctx, viewport }).promise;
+
+          const matches = await findTemplateMatch(offscreenCanvas, imgElem, 1.0, viewport.height, {
+            refImageId: refImg.id,
+            refImageName: refImg.name
+          });
+
+          newMatches.push(...matches.map(m => ({
+            ...m,
+            refImageId: refImg.id,
+            refImageName: refImg.name,
+            ruleId: refImg.ruleId || null,
+            pageNumber: i,
+            id: `p${i}-${refImg.id}-${m.id}`
+          })));
+        }
+      }
+
+      if (newMatches.length > 0) {
+        setDocumentTextItems(prev => {
+          const scannedRefIds = new Set(refImagesToScan.map(r => r.id));
+          const filtered = prev.filter(item => !(item.type === 'image-match' && scannedRefIds.has(item.refImageId)));
+          return filtered.concat(newMatches);
+        });
+      }
+    } catch (err) {
+      console.error("Error scanning document for reference images", err);
+    } finally {
+      setIsExtractingML(false);
+    }
+    return newMatches;
+  };
+
+  const handleReferenceImageUpload = async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
+
+    setIsExtractingML(true);
+    // Yield to let browser render the spinner before computational tasks
+    await new Promise(r => setTimeout(r, 60));
+
+    try {
+      const newImagesList = [];
+
+      for (const file of files) {
+        await new Promise((resolve) => {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const img = new Image();
+            img.onload = async () => {
+              try {
+                let hash = null;
+                try {
+                  hash = await getEmbeddingFromImageElement(img);
+                } catch (e) {
+                  console.warn("Could not extract embedding for reference image", e);
+                }
+                const refId = `ref-img-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+                const newRefImage = {
+                  id: refId,
+                  name: file.name.replace(/\.[^/.]+$/, "") || `Image ${referenceImages.length + newImagesList.length + 1}`,
+                  preview: event.target.result,
+                  hash,
+                  element: img
+                };
+                newImagesList.push(newRefImage);
+              } catch (err) {
+                console.error("Failed ML extraction for reference image", err);
+              } finally {
+                resolve();
+              }
+            };
+            img.src = event.target.result;
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+
+      if (newImagesList.length > 0) {
+        setReferenceImages(prev => {
+          const updated = [...prev, ...newImagesList];
+          referenceImagesRef.current = updated;
+          return updated;
+        });
+        // Select the newly added image so the user can immediately act on it
+        setSelectedRefImageId(newImagesList[newImagesList.length - 1].id);
+
+        // Run template matching across all pages of the current PDF
+        if (pdfDocument) {
+          await scanDocumentForReferenceImages(pdfDocument, newImagesList);
+        }
+
+        // Auto-save uploaded reference images into projectRules so they immediately appear in SAVED RULES
+        for (const refImg of newImagesList) {
+          const ruleExists = projectRules.some(r => r.type === 'image' && (r.refImageId === refImg.id || r.query === refImg.name));
+          if (!ruleExists) {
+            let preview = refImg.preview;
+            if (refImg.element) {
+              try {
+                preview = createThumbnailDataUrl(refImg.element, 120);
+              } catch {
+                preview = refImg.preview;
+              }
+            }
+            await ruleService.addRule(projectId, {
+              query: refImg.name,
+              action: activeTab,
+              type: 'image',
+              refImageId: refImg.id,
+              preview,
+              hash: refImg.hash
+            });
+          }
+        }
+        await reloadRules();
+      }
+    } catch (err) {
+      console.error("Failed processing reference image", err);
+    } finally {
+      setIsExtractingML(false);
+      if (refImageInputRef.current) refImageInputRef.current.value = '';
+    }
+  };
+
+  const handleRemoveReferenceImage = (refId, e) => {
+    if (e) e.stopPropagation();
+    setReferenceImages(prev => {
+      const updated = prev.filter(img => img.id !== refId);
+      referenceImagesRef.current = updated;
+      return updated;
+    });
+    setDocumentTextItems(prev => prev.filter(item => item.refImageId !== refId));
+    setSelectedRefImageId(prev => {
+      if (prev === refId) {
+        const remaining = referenceImages.filter(img => img.id !== refId);
+        return remaining.length > 0 ? remaining[0].id : null;
+      }
+      return prev;
+    });
+  };
+
+  const clearAllReferenceImages = () => {
+    setReferenceImages([]);
+    referenceImagesRef.current = [];
+    setSelectedRefImageId(null);
+    setDocumentTextItems(prev => prev.filter(item => !item.refImageId && item.type !== 'image-match'));
+    if (refImageInputRef.current) refImageInputRef.current.value = '';
+  };
 
 
 
@@ -87,10 +361,10 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
         
         const baseHeight = match.height || match.transform[3] || 12;
         
-        const queryText = match.rule ? match.rule.query : searchQuery;
+        const queryText = (match.rule ? match.rule.query : searchQuery) || '';
         const queryLower = queryText.toLowerCase();
-        const strLower = match.str.toLowerCase();
-        const idx = strLower.indexOf(queryLower);
+        const strLower = (match.str || '').toLowerCase();
+        const idx = queryLower ? strLower.indexOf(queryLower) : -1;
         
         let relativeStart = 0;
         let relativeWidth = 1;
@@ -113,14 +387,22 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
            }
         }
 
-        const paddingX = baseHeight * 0.05;
-        const estimatedX = match.transform[4] + (relativeStart * match.width);
-        const estimatedWidth = relativeWidth * match.width;
-        
-        const x = estimatedX - paddingX;
-        const y = match.transform[5] - (baseHeight * 0.25);
-        const width = estimatedWidth + (paddingX * 2);
-        const height = baseHeight * 1.4;
+        let x, y, width, height;
+        if (match.type === 'image' || match.type === 'image-detected' || match.type === 'image-match') {
+          x = match.transform[4];
+          y = match.transform[5];
+          width = match.width;
+          height = match.height;
+        } else {
+          const paddingX = baseHeight * 0.05;
+          const estimatedX = match.transform[4] + (relativeStart * match.width);
+          const estimatedWidth = relativeWidth * match.width;
+          
+          x = estimatedX - paddingX;
+          y = match.transform[5] - (baseHeight * 0.25);
+          width = estimatedWidth + (paddingX * 2);
+          height = baseHeight * 1.4;
+        }
 
         if (action === 'redact') {
           page.drawRectangle({ x, y, width, height, color: rgb(0, 0, 0) });
@@ -128,7 +410,10 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
           page.drawRectangle({ x, y, width, height, color: rgb(0.5, 0.9, 0.5), opacity: 0.8 });
         } else if (action === 'replace') {
           page.drawRectangle({ x, y, width, height, color: rgb(1, 1, 1) });
-          page.drawText("[SYNTHETIC]", { x: x + 2, y: y + (height * 0.2), size: baseHeight * 0.8, color: rgb(0, 0, 0) });
+          const isImg = match.type === 'image' || match.type === 'image-detected' || match.type === 'image-match';
+          const textSize = isImg ? Math.min(10, Math.max(7, height * 0.22)) : Math.min(baseHeight * 0.8, 14);
+          const textY = isImg ? y + (height * 0.38) : y + (height * 0.2);
+          page.drawText("[SYNTHETIC]", { x: x + 2, y: textY, size: textSize, color: rgb(0, 0, 0) });
         } else if (action === 'remove') {
           page.drawRectangle({ x, y, width, height, color: rgb(1, 1, 1) });
         }
@@ -137,12 +422,20 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
       const pdfBytes = await pdfDoc.save();
       
       if (targetDocId === doc.id) {
+        isApplyingRedactionRef.current = true;
         const newHistory = history.slice(0, historyIndex + 1);
         newHistory.push(pdfBytes);
         setHistory(newHistory);
         setHistoryIndex(newHistory.length - 1);
         setPdfFile(pdfBytes);
         setSelectedMatchIds(new Set());
+        // Remove redacted items from in-memory state so they are no longer highlighted or matched
+        const appliedIds = new Set();
+        matchesToProtect.forEach(m => {
+          if (m.id) appliedIds.add(m.id);
+          if (m.matchId) appliedIds.add(m.matchId);
+        });
+        setDocumentTextItems(prev => prev.filter(item => !appliedIds.has(item.id) && !appliedIds.has(item.matchId)));
       }
       
       updateDocumentBuffer(targetDocId, pdfBytes);
@@ -155,24 +448,103 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
     }
   };
 
+  const createThumbnailDataUrl = (imgElement, maxDim = 120) => {
+    if (!imgElement) return null;
+    const canvas = document.createElement('canvas');
+    const w = imgElement.naturalWidth || imgElement.width || 1;
+    const h = imgElement.naturalHeight || imgElement.height || 1;
+    const scale = Math.min(1, maxDim / Math.max(w, h));
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(imgElement, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.85);
+  };
+
   const handleApplySavedRules = async () => {
-    const savedMatches = searchResults.filter(r => r.rule);
-    if (savedMatches.length > 0) {
-      await handleApplyRedactions(savedMatches);
-    } else {
-      alert("No matches found for the saved rules in this document.");
+    if (projectRules.length === 0 || !pdfDocument) return;
+    setIsExporting(true);
+    try {
+      let savedMatches = [];
+      
+      // 1. Text rules
+      const textRules = projectRules.filter(r => r.type !== 'image');
+      textRules.forEach(rule => {
+        const query = rule.query.toLowerCase();
+        const ruleMatches = documentTextItems
+          .filter(item => item.str && item.type !== 'image' && item.type !== 'image-match' && item.str.toLowerCase().includes(query))
+          .map(m => ({ ...m, rule, matchId: `rule-${rule.id}-${m.id}` }));
+        savedMatches = savedMatches.concat(ruleMatches);
+      });
+
+      // 2. Image rules
+      const imageRules = projectRules.filter(r => r.type === 'image');
+      for (const rule of imageRules) {
+        let imgMatches = documentTextItems
+          .filter(item => 
+            (item.type === 'image-match' && (item.refImageId === rule.refImageId || item.refImageName === rule.query || item.ruleId === rule.id)) ||
+            (item.type === 'image' && item.hash && rule.hash && cosineSimilarity(item.hash, rule.hash) > 0.80)
+          )
+          .map(m => ({ ...m, rule, matchId: `rule-img-${rule.id}-${m.id}` }));
+
+        // If no matches found in memory yet, scan on the fly!
+        if (imgMatches.length === 0 && (rule.preview || rule.element)) {
+          const ruleRef = {
+            id: rule.refImageId || `rule-ref-${rule.id}`,
+            name: rule.query,
+            preview: rule.preview,
+            element: rule.element,
+            ruleId: rule.id
+          };
+          const freshMatches = await scanDocumentForReferenceImages(pdfDocument, [ruleRef]);
+          imgMatches = freshMatches.map(m => ({ ...m, rule, matchId: `rule-img-${rule.id}-${m.id}` }));
+        }
+
+        savedMatches = savedMatches.concat(imgMatches);
+      }
+
+      // Deduplicate matches
+      const uniqueMatches = [];
+      const seen = new Set();
+      for (const m of savedMatches) {
+        if (!seen.has(m.id)) {
+          seen.add(m.id);
+          uniqueMatches.push(m);
+        }
+      }
+
+      if (uniqueMatches.length > 0) {
+        await handleApplyRedactions(uniqueMatches);
+      } else {
+        alert("No matches found for the saved rules in this document.");
+      }
+    } catch (e) {
+      console.error("Error applying saved rules", e);
+      alert("Failed to apply saved rules: " + (e.message || "Unknown error"));
+    } finally {
+      setIsExporting(false);
     }
   };
 
   const handleDeleteRule = async (ruleId) => {
+    const deletedRule = projectRules.find(r => r.id === ruleId);
     await ruleService.deleteRule(projectId, ruleId);
-    reloadRules();
+    await reloadRules();
+    if (deletedRule && deletedRule.type === 'image') {
+      const targetRefId = deletedRule.refImageId || `ref-${deletedRule.id}`;
+      setReferenceImages(prev => {
+        const updated = prev.filter(img => img.id !== targetRefId && img.ruleId !== ruleId && img.name !== deletedRule.query);
+        referenceImagesRef.current = updated;
+        return updated;
+      });
+      setDocumentTextItems(prev => prev.filter(item => item.refImageId !== targetRefId && item.ruleId !== ruleId));
+    }
   };
 
   const handleSaveRuleEdit = async (ruleId, newQuery) => {
     if (newQuery && newQuery.trim()) {
       await ruleService.updateRule(projectId, ruleId, { query: newQuery.trim() });
-      reloadRules();
+      await reloadRules();
       setSavedRuleIds(prev => {
         const next = new Set(prev);
         next.add(ruleId);
@@ -181,58 +553,190 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
     }
   };
 
-  const saveQueryAsRuleIfNotExists = async () => {
-    if (!searchQuery.trim()) return;
-    const queryLower = searchQuery.trim().toLowerCase();
-    const ruleExists = projectRules.some(r => r.query.toLowerCase() === queryLower);
+  const handleSaveImageAsRule = async (refImg, e) => {
+    if (e) e.stopPropagation();
+    const ruleExists = projectRules.some(r => 
+      (r.type === 'image' && (r.refImageId === refImg.id || r.query === refImg.name))
+    );
     if (!ruleExists) {
-      await ruleService.addRule(projectId, { query: searchQuery.trim(), action: activeTab });
-      reloadRules();
+      let preview = refImg.preview;
+      if (refImg.element) {
+        try {
+          preview = createThumbnailDataUrl(refImg.element, 120);
+        } catch {
+          preview = refImg.preview;
+        }
+      }
+      await ruleService.addRule(projectId, {
+        query: refImg.name,
+        action: activeTab,
+        type: 'image',
+        refImageId: refImg.id,
+        preview,
+        hash: refImg.hash
+      });
+      await reloadRules();
+    }
+  };
+
+  const saveCurrentRulesIfNotExists = async () => {
+    let ruleAdded = false;
+
+    // 1. Save text query rule if present
+    if (searchQuery.trim()) {
+      const queryLower = searchQuery.trim().toLowerCase();
+      const ruleExists = projectRules.some(r => r.type !== 'image' && r.query && r.query.toLowerCase() === queryLower);
+      if (!ruleExists) {
+        await ruleService.addRule(projectId, { 
+          query: searchQuery.trim(), 
+          action: activeTab,
+          type: 'text'
+        });
+        ruleAdded = true;
+      }
+    }
+
+    // 2. Save active or matched reference image(s) as rules
+    const activeRefImages = (selectedRefImageId && selectedRefImageId !== 'all')
+      ? referenceImages.filter(img => img.id === selectedRefImageId)
+      : referenceImages;
+
+    for (const refImg of activeRefImages) {
+      const ruleExists = projectRules.some(r => 
+        (r.type === 'image' && (r.refImageId === refImg.id || r.query === refImg.name))
+      );
+      if (!ruleExists) {
+        let preview = refImg.preview;
+        if (refImg.element) {
+          try {
+            preview = createThumbnailDataUrl(refImg.element, 120);
+          } catch {
+            preview = refImg.preview;
+          }
+        }
+        await ruleService.addRule(projectId, {
+          query: refImg.name,
+          action: activeTab,
+          type: 'image',
+          refImageId: refImg.id,
+          preview,
+          hash: refImg.hash
+        });
+        ruleAdded = true;
+      }
+    }
+
+    if (ruleAdded) {
+      await reloadRules();
     }
   };
 
   const handleApplyToAllPdfs = async () => {
-    if (projectRules.length === 0 && !searchQuery.trim()) return;
+    if (projectRules.length === 0 && !searchQuery.trim() && referenceImages.length === 0) return;
     
-    // Save the current search query as a rule if it doesn't exist
-    await saveQueryAsRuleIfNotExists();
+    // Save current search query or active image as rule
+    await saveCurrentRulesIfNotExists();
     
     setIsExporting(true);
     
     try {
+      // Collect all image references from referenceImages and projectRules
+      const allImageRefsToScan = [...referenceImages];
+      const imageRules = projectRules.filter(r => r.type === 'image');
+      for (const ir of imageRules) {
+        if (!allImageRefsToScan.some(ref => ref.id === ir.refImageId || ref.name === ir.query || ref.ruleId === ir.id)) {
+          allImageRefsToScan.push({
+            id: ir.refImageId || `rule-ref-${ir.id}`,
+            name: ir.query,
+            preview: ir.preview,
+            element: ir.element,
+            hash: ir.hash,
+            ruleId: ir.id
+          });
+        }
+      }
+
+      // Ensure current document has been scanned for all image rules
+      let currentItems = [...documentTextItems];
+      if (allImageRefsToScan.length > 0 && pdfDocument) {
+        const existingScannedIds = new Set(currentItems.filter(i => i.type === 'image-match').map(i => i.refImageId || i.ruleId || i.refImageName));
+        const unscannedRefs = allImageRefsToScan.filter(ref => !existingScannedIds.has(ref.id) && !existingScannedIds.has(ref.ruleId) && !existingScannedIds.has(ref.name));
+        if (unscannedRefs.length > 0) {
+          const freshMatches = await scanDocumentForReferenceImages(pdfDocument, unscannedRefs);
+          currentItems = currentItems.concat(freshMatches);
+        }
+      }
+
       const getMatchesForItems = (items) => {
         let matches = [];
-        projectRules.forEach(rule => {
+        
+        // Match text rules
+        projectRules.filter(r => r.type !== 'image').forEach(rule => {
           const query = rule.query.toLowerCase();
           const ruleMatches = items
-            .filter(item => item.str.toLowerCase().includes(query))
+            .filter(item => item.str && item.type !== 'image' && item.type !== 'image-match' && item.str.toLowerCase().includes(query))
             .map(m => ({ ...m, rule, matchId: `rule-${rule.id}-${m.id}` }));
+          matches = matches.concat(ruleMatches);
+        });
+
+        // Match image rules
+        projectRules.filter(r => r.type === 'image').forEach(rule => {
+          const ruleMatches = items
+            .filter(item => 
+              (item.type === 'image-match' && (item.refImageId === rule.refImageId || item.refImageName === rule.query || item.ruleId === rule.id)) ||
+              (item.type === 'image' && item.hash && rule.hash && cosineSimilarity(item.hash, rule.hash) > 0.80)
+            )
+            .map(m => ({ ...m, rule, matchId: `rule-img-${rule.id}-${m.id}` }));
           matches = matches.concat(ruleMatches);
         });
         
         if (searchQuery.trim()) {
           const query = searchQuery.toLowerCase();
           const searchMatches = items
-            .filter(item => item.str.toLowerCase().includes(query))
+            .filter(item => item.str && item.type !== 'image' && item.type !== 'image-match' && item.str.toLowerCase().includes(query))
             .map(m => ({ ...m, matchId: `search-${m.id}` }));
           matches = matches.concat(searchMatches);
         }
-        return matches;
+
+        // Match active reference images
+        const activeRefImages = (selectedRefImageId && selectedRefImageId !== 'all')
+          ? referenceImages.filter(img => img.id === selectedRefImageId)
+          : referenceImages;
+        activeRefImages.forEach(refImg => {
+          const refMatches = items
+            .filter(item => item.type === 'image-match' && item.refImageId === refImg.id && !matches.some(m => m.id === item.id))
+            .map(m => ({ ...m, matchId: `ref-match-${refImg.id}-${m.id}` }));
+          matches = matches.concat(refMatches);
+        });
+
+        // Deduplicate
+        const unique = [];
+        const seen = new Set();
+        for (const m of matches) {
+          if (!seen.has(m.id)) {
+            seen.add(m.id);
+            unique.push(m);
+          }
+        }
+        return unique;
       };
 
+      let totalApplied = 0;
       for (const currentDoc of documents) {
         if (currentDoc.id === doc?.id) {
-          const matches = getMatchesForItems(documentTextItems);
+          const matches = getMatchesForItems(currentItems);
           if (matches.length > 0) {
             await handleApplyRedactions(matches, currentDoc.buffer, currentDoc.id);
+            totalApplied += matches.length;
           }
           continue;
         }
 
+        // Process background PDFs
         const loadingTask = pdfjsLib.getDocument({ data: currentDoc.buffer.slice(0) });
         const pdf = await loadingTask.promise;
         
-        let allTextItems = [];
+        let allItems = [];
         for (let i = 1; i <= pdf.numPages; i++) {
           const page = await pdf.getPage(i);
           const textContent = await page.getTextContent();
@@ -241,18 +745,58 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
             pageNumber: i,
             id: `p${i}-${index}`
           }));
-          allTextItems = allTextItems.concat(pageItems);
+          allItems = allItems.concat(pageItems);
+
+          if (allImageRefsToScan.length > 0) {
+            const viewport = page.getViewport({ scale: 1.0 });
+            const offCanvas = document.createElement('canvas');
+            offCanvas.width = viewport.width;
+            offCanvas.height = viewport.height;
+            const ctx = offCanvas.getContext('2d');
+            await page.render({ canvasContext: ctx, viewport }).promise;
+
+            for (const refImg of allImageRefsToScan) {
+              let imgElem = refImg.element;
+              if (!imgElem || !imgElem.complete || (imgElem.naturalWidth || 0) === 0) {
+                const src = (imgElem && imgElem.src) || refImg.preview;
+                if (src) {
+                  imgElem = await new Promise((resolve) => {
+                    const im = new Image();
+                    im.onload = () => resolve(im);
+                    im.onerror = () => resolve(null);
+                    im.src = src;
+                  });
+                }
+              }
+              if (imgElem) {
+                const tMatches = await findTemplateMatch(offCanvas, imgElem, 1.0, viewport.height, {
+                  refImageId: refImg.id,
+                  refImageName: refImg.name
+                });
+                allItems = allItems.concat(tMatches.map(m => ({
+                  ...m,
+                  pageNumber: i,
+                  refImageId: refImg.id,
+                  refImageName: refImg.name
+                })));
+              }
+            }
+          }
         }
         
-        const matches = getMatchesForItems(allTextItems);
-        
+        const matches = getMatchesForItems(allItems);
         if (matches.length > 0) {
           await handleApplyRedactions(matches, currentDoc.buffer, currentDoc.id);
+          totalApplied += matches.length;
         }
+      }
+
+      if (totalApplied === 0) {
+        alert("No matches found for the active rules in this document.");
       }
     } catch (error) {
       console.error("Failed to apply to all PDFs", error);
-      alert("An error occurred while processing background PDFs.");
+      alert("An error occurred while processing: " + (error.message || "Unknown error"));
     } finally {
       setIsExporting(false);
     }
@@ -280,7 +824,26 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
         setPdfDocument(pdf);
         setTotalPages(pdf.numPages);
 
+        // If we just applied a redaction, do NOT re-extract or re-scan previously uploaded images!
+        if (isApplyingRedactionRef.current) {
+          isApplyingRedactionRef.current = false;
+          return;
+        }
+
         let allTextItems = [];
+        let allImageItems = [];
+        
+        const matrixMultiply = (m1, m2) => {
+          return [
+            m1[0] * m2[0] + m1[2] * m2[1],
+            m1[1] * m2[0] + m1[3] * m2[1],
+            m1[0] * m2[2] + m1[2] * m2[3],
+            m1[1] * m2[2] + m1[3] * m2[3],
+            m1[0] * m2[4] + m1[2] * m2[5] + m1[4],
+            m1[1] * m2[4] + m1[3] * m2[5] + m1[5]
+          ];
+        };
+
         for (let i = 1; i <= pdf.numPages; i++) {
           const page = await pdf.getPage(i);
           const textContent = await page.getTextContent();
@@ -290,11 +853,96 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
             id: `p${i}-${index}`
           }));
           allTextItems = allTextItems.concat(pageItems);
+
+          try {
+            const opList = await page.getOperatorList();
+            let currentTransform = [1, 0, 0, 1, 0, 0];
+            let transformStack = [];
+            
+            for (let j = 0; j < opList.fnArray.length; j++) {
+              const fn = opList.fnArray[j];
+              const args = opList.argsArray[j];
+              
+              if (fn === pdfjsLib.OPS.save) {
+                transformStack.push([...currentTransform]);
+              } else if (fn === pdfjsLib.OPS.restore) {
+                if (transformStack.length > 0) {
+                  currentTransform = transformStack.pop();
+                }
+              } else if (fn === pdfjsLib.OPS.transform) {
+                currentTransform = matrixMultiply(currentTransform, args);
+              } else if (fn === pdfjsLib.OPS.paintImageXObject || fn === pdfjsLib.OPS.paintJpegXObject || fn === pdfjsLib.OPS.paintInlineImageXObject) {
+                let imgHash = null;
+                try {
+                  if (fn === pdfjsLib.OPS.paintInlineImageXObject) {
+                    if (args[0] && args[0].data) {
+                      imgHash = await getEmbeddingFromImageData(args[0].data, args[0].width, args[0].height);
+                    }
+                  } else {
+                    const imgObj = page.objs.get(args[0]);
+                    if (imgObj) {
+                       if (imgObj instanceof HTMLImageElement || imgObj instanceof HTMLCanvasElement || imgObj instanceof ImageBitmap) {
+                          imgHash = await getEmbeddingFromImageElement(imgObj);
+                       } else if (imgObj.data) {
+                          imgHash = await getEmbeddingFromImageData(imgObj.data, imgObj.width, imgObj.height);
+                       }
+                    }
+                  }
+                } catch(e) {
+                   console.log("Error extracting ML features", e);
+                }
+
+                allImageItems.push({
+                  type: 'image',
+                  pageNumber: i,
+                  id: `p${i}-img${j}`,
+                  str: '[IMAGE]',
+                  transform: [...currentTransform],
+                  width: Math.abs(currentTransform[0]),
+                  height: Math.abs(currentTransform[3]),
+                  hash: imgHash
+                });
+              }
+            }
+          } catch (e) {
+            console.error("Error parsing images on page", i, e);
+          }
+
         }
-        setDocumentTextItems(allTextItems);
+        
+        // Preserve active reference image matches and update document items immediately without blocking
+        setDocumentTextItems(prev => {
+          const activeRefIds = new Set((referenceImagesRef.current || []).map(r => r.id));
+          const existingRefMatches = prev.filter(item => 
+            item.type === 'image-match' && (!item.refImageId || activeRefIds.has(item.refImageId))
+          );
+          return allTextItems.concat(allImageItems).concat(existingRefMatches);
+        });
+
+        // Only scan reference images when a brand new document is loaded (doc.id changed)
+        if (scannedDocIdRef.current !== doc?.id) {
+          scannedDocIdRef.current = doc?.id;
+          const refsToScan = [...(referenceImagesRef.current || [])];
+          const imageRules = (projectRules || []).filter(r => r.type === 'image' && r.preview);
+          for (const ir of imageRules) {
+            if (!refsToScan.some(ref => ref.id === ir.refImageId || ref.name === ir.query || ref.ruleId === ir.id)) {
+              refsToScan.push({
+                id: ir.refImageId || `rule-ref-${ir.id}`,
+                name: ir.query,
+                preview: ir.preview,
+                ruleId: ir.id
+              });
+            }
+          }
+          if (refsToScan.length > 0) {
+            scanDocumentForReferenceImages(pdf, refsToScan);
+          }
+        }
 
       } catch (error) {
         console.error("Error loading PDF", error);
+      } finally {
+        isApplyingRedactionRef.current = false;
       }
     };
     loadPdf();
@@ -304,16 +952,100 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
     let results = [];
     
     if (searchQuery.trim()) {
-      // If actively searching, only show search matches
       const query = searchQuery.toLowerCase();
       results = documentTextItems
-        .filter(item => item.str.toLowerCase().includes(query))
+        .filter(item => item.str.toLowerCase().includes(query) && item.type !== 'image' && item.type !== 'image-detected' && item.type !== 'image-match')
         .map(m => ({ ...m, matchId: `search-${m.id}` }));
     }
     
-    setSearchResults(results);
-    setSelectedMatchIds(new Set(results.map(r => r.matchId)));
-  }, [documentTextItems, searchQuery]);
+    const activeRefImages = (selectedRefImageId && selectedRefImageId !== 'all')
+      ? referenceImages.filter(img => img.id === selectedRefImageId)
+      : referenceImages;
+
+    activeRefImages.forEach(refImg => {
+      if (refImg.hash) {
+        const imageMatches = documentTextItems
+          .filter(item => item.type === 'image' && item.hash)
+          .filter(item => cosineSimilarity(item.hash, refImg.hash) > 0.80)
+          .map(m => ({ 
+            ...m, 
+            refImageId: refImg.id,
+            refImageName: refImg.name,
+            matchId: `img-match-${refImg.id}-${m.id}`, 
+            str: `[IMAGE MATCH: ${refImg.name}]` 
+          }));
+        results = results.concat(imageMatches);
+      }
+    });
+
+    const targetRefIds = new Set(activeRefImages.map(img => img.id));
+    const imageRuleRefIds = new Set((projectRules || []).filter(r => r.type === 'image').map(r => r.refImageId || `rule-ref-${r.id}`));
+    const imageRuleNames = new Set((projectRules || []).filter(r => r.type === 'image').map(r => r.query));
+
+    const templateMatches = documentTextItems
+      .filter(item => item.type === 'image-match' && (
+        !item.refImageId || 
+        targetRefIds.has(item.refImageId) || 
+        imageRuleRefIds.has(item.refImageId) ||
+        (item.ruleId && (projectRules || []).some(r => r.id === item.ruleId)) ||
+        (item.refImageName && imageRuleNames.has(item.refImageName))
+      ))
+      .map(m => ({ 
+        ...m, 
+        matchId: `tpl-img-${m.id}` 
+      }));
+    results = results.concat(templateMatches);
+    
+    if (!selectedRefImageId && referenceImages.length === 0) {
+      const cvImageMatches = documentTextItems
+        .filter(item => item.type === 'image-detected')
+        .map(m => ({ ...m, matchId: `cv-img-${m.id}` }));
+      results = results.concat(cvImageMatches);
+    }
+    
+    const uniqueResults = [];
+    const seenMatchIds = new Set();
+    for (const r of results) {
+      if (!seenMatchIds.has(r.matchId)) {
+        seenMatchIds.add(r.matchId);
+        uniqueResults.push(r);
+      }
+    }
+
+    // Spatial deduplication for image matches to prevent duplicate badges/redactions on the same logo
+    const finalResults = [];
+    const keptImages = [];
+    for (const r of uniqueResults) {
+      if (r.type === 'image' || r.type === 'image-match' || r.type === 'image-detected') {
+        const rX = r.pdfX !== undefined ? r.pdfX : (r.transform ? r.transform[4] : 0);
+        const rY = r.pdfY !== undefined ? r.pdfY : (r.transform ? r.transform[5] : 0);
+        const rW = r.pdfWidth || r.width || 1;
+        const rH = r.pdfHeight || r.height || 1;
+
+        const overlaps = keptImages.some(existing => {
+          if (existing.pageNumber !== r.pageNumber) return false;
+          const eX = existing.pdfX !== undefined ? existing.pdfX : (existing.transform ? existing.transform[4] : 0);
+          const eY = existing.pdfY !== undefined ? existing.pdfY : (existing.transform ? existing.transform[5] : 0);
+          const eW = existing.pdfWidth || existing.width || 1;
+          const eH = existing.pdfHeight || existing.height || 1;
+
+          const xOverlap = Math.max(0, Math.min(rX + rW, eX + eW) - Math.max(rX, eX));
+          const yOverlap = Math.max(0, Math.min(rY + rH, eY + eH) - Math.max(rY, eY));
+          return (xOverlap * yOverlap) > (Math.min(rW * rH, eW * eH) * 0.4);
+        });
+
+        if (!overlaps) {
+          keptImages.push(r);
+          finalResults.push(r);
+        }
+      } else {
+        finalResults.push(r);
+      }
+    }
+
+    setSearchResults(finalResults);
+    setSelectedMatchIds(new Set(finalResults.map(r => r.matchId)));
+  }, [documentTextItems, searchQuery, referenceImages, selectedRefImageId, projectRules]);
 
   const renderHighlightedText = (text, query, isSelected) => {
     if (!query) return text;
@@ -356,6 +1088,20 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
     }
   }, [pdfDocument, activePage, zoomScale]);
 
+  const handleFitWidth = () => {
+    if (!pdfDocument) return;
+    const container = document.querySelector('.pdf-container');
+    if (!container) return;
+    pdfDocument.getPage(activePage).then(page => {
+      const viewport = page.getViewport({ scale: 1.0 });
+      const availableWidth = container.clientWidth - 48;
+      if (availableWidth > 0 && viewport.width > 0) {
+        const fitScale = Math.min(2.5, Math.max(0.5, availableWidth / viewport.width));
+        setZoomScale(parseFloat(fitScale.toFixed(2)));
+      }
+    });
+  };
+
   return (
     <div className="editor-workspace-container" style={{ display: 'flex', flexDirection: 'column', height: '100%', flex: 1, overflow: 'hidden' }}>
       {/* Top Toolbar */}
@@ -384,10 +1130,10 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
           
           <div className="divider"></div>
           
-          <button className="icon-btn" disabled={!doc} onClick={() => setZoomScale(s => Math.max(0.5, s - 0.1))}><ZoomOut size={16}/></button>
+          <button className="icon-btn" disabled={!doc} onClick={() => setZoomScale(s => Math.max(0.5, parseFloat((s - 0.1).toFixed(2))))}><ZoomOut size={16}/></button>
           <span className="zoom-level" style={{ minWidth: '40px', textAlign: 'center' }}>{Math.round(zoomScale * 100)}%</span>
-          <button className="icon-btn" disabled={!doc} onClick={() => setZoomScale(s => Math.min(3, s + 0.1))}><ZoomIn size={16}/></button>
-          <button className="text-btn" disabled={!doc}>Fit Width</button>
+          <button className="icon-btn" disabled={!doc} onClick={() => setZoomScale(s => Math.min(3, parseFloat((s + 0.1).toFixed(2))))}><ZoomIn size={16}/></button>
+          <button className="text-btn" disabled={!doc} onClick={handleFitWidth}>Fit Width</button>
           
           <div className="divider"></div>
           
@@ -433,36 +1179,75 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
                   key={rule.id} 
                   onClick={(e) => {
                     if (e.target.tagName !== 'INPUT' && !e.target.closest('button')) {
-                      setSearchQuery(rule.query);
+                      if (rule.type === 'image') {
+                        let targetRef = referenceImages.find(r => r.id === rule.refImageId || r.name === rule.query);
+                        if (!targetRef && rule.preview) {
+                          const img = new Image();
+                          img.src = rule.preview;
+                          targetRef = {
+                            id: rule.refImageId || `ref-${rule.id}`,
+                            name: rule.query,
+                            preview: rule.preview,
+                            hash: rule.hash || null,
+                            element: img
+                          };
+                          setReferenceImages(prev => {
+                            const updated = [...prev, targetRef];
+                            referenceImagesRef.current = updated;
+                            return updated;
+                          });
+                        }
+                        if (targetRef) {
+                          setSelectedRefImageId(targetRef.id);
+                          if (pdfDocument) {
+                            scanDocumentForReferenceImages(pdfDocument, [targetRef]);
+                          }
+                        }
+                        setSearchQuery('');
+                      } else {
+                        setSearchQuery(rule.query);
+                      }
                       setActiveTab(rule.action);
                     }
                   }}
                   style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem', padding: '0.5rem', background: savedRuleIds.has(rule.id) ? 'rgba(15, 157, 88, 0.1)' : 'white', borderRadius: '4px', border: savedRuleIds.has(rule.id) ? '1px solid var(--green-primary)' : '1px solid rgba(0,0,0,0.1)', transition: 'all 0.3s ease', cursor: 'pointer' }}
                 >
-                  <div style={{ flex: 1, marginRight: '0.5rem' }}>
-                    <input 
-                      type="text" 
-                      defaultValue={rule.query}
-                      onBlur={(e) => handleSaveRuleEdit(rule.id, e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter') handleSaveRuleEdit(rule.id, e.target.value); }}
-                      onChange={() => {
-                        if (savedRuleIds.has(rule.id)) {
-                          setSavedRuleIds(prev => {
-                            const next = new Set(prev);
-                            next.delete(rule.id);
-                            return next;
-                          });
-                        }
-                      }}
-                      style={{ fontSize: '0.85rem', width: '100%', border: 'none', background: 'transparent', outline: 'none', fontWeight: 'bold', padding: 0 }}
-                    />
-                    <div style={{ fontSize: '0.7rem', color: '#666', textTransform: 'uppercase' }}>{rule.action}</div>
+                  <div style={{ flex: 1, marginRight: '0.5rem', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    {rule.type === 'image' && rule.preview ? (
+                      <div style={{ width: '28px', height: '28px', borderRadius: '4px', overflow: 'hidden', border: '1px solid rgba(0,0,0,0.1)', background: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                        <img src={rule.preview} alt={rule.query} style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain' }} />
+                      </div>
+                    ) : (
+                      rule.type === 'image' ? <ImageIcon size={16} style={{ color: 'var(--green-primary)', flexShrink: 0 }} /> : null
+                    )}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <input 
+                        type="text" 
+                        defaultValue={rule.query}
+                        onBlur={(e) => handleSaveRuleEdit(rule.id, e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') handleSaveRuleEdit(rule.id, e.target.value); }}
+                        onChange={() => {
+                          if (savedRuleIds.has(rule.id)) {
+                            setSavedRuleIds(prev => {
+                              const next = new Set(prev);
+                              next.delete(rule.id);
+                              return next;
+                            });
+                          }
+                        }}
+                        style={{ fontSize: '0.85rem', width: '100%', border: 'none', background: 'transparent', outline: 'none', fontWeight: 'bold', padding: 0 }}
+                      />
+                      <div style={{ fontSize: '0.7rem', color: '#666', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                        {rule.type === 'image' && <span style={{ fontSize: '0.62rem', background: '#e8f5e9', color: '#2e7d32', padding: '1px 4px', borderRadius: '3px', fontWeight: 700 }}>IMAGE</span>}
+                        <span>{rule.action}</span>
+                      </div>
+                    </div>
                   </div>
                   <div style={{ display: 'flex', gap: '4px', flexShrink: 0 }}>
                     <button 
                       className="icon-btn-subtle" 
                       onClick={(e) => {
-                        const input = e.currentTarget.parentElement.previousSibling.querySelector('input');
+                        const input = e.currentTarget.parentElement.previousElementSibling?.querySelector('input');
                         if (input) handleSaveRuleEdit(rule.id, input.value);
                       }} 
                       style={{ color: savedRuleIds.has(rule.id) ? 'var(--green-primary)' : '#666', background: 'none', border: 'none', cursor: 'pointer', padding: '4px', transition: 'color 0.3s ease' }} 
@@ -477,43 +1262,30 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
             
             {projectRules.length === 0 && (
               <div style={{ fontSize: '0.75rem', color: '#888', textAlign: 'center', margin: '1rem 0' }}>
-                No rules saved yet.
+                <div>No rules saved yet in this project.</div>
+                {availableOtherRules.length > 0 && (
+                  <button
+                    className="btn btn-outline-dark btn-xs"
+                    style={{ marginTop: '0.5rem', fontSize: '0.68rem', padding: '4px 8px', borderColor: 'var(--green-primary)', color: 'var(--green-deep)' }}
+                    onClick={handleImportOtherRules}
+                  >
+                    + Import {availableOtherRules.length} rules from library
+                  </button>
+                )}
               </div>
             )}
             
-            <button 
-              className="btn btn-outline-dark" 
-              style={{ width: '100%', marginTop: '0.5rem', marginBottom: '0.5rem', fontWeight: 'bold', fontSize: '0.75rem' }}
-              disabled={!searchQuery.trim() || isExporting}
-              onClick={async () => {
-                await ruleService.addRule(projectId, { query: searchQuery.trim(), action: activeTab });
-                reloadRules();
-                setSearchQuery('');
-              }}
-            >
-              <Shield size={14} className="inline mr-2" /> SAVE CURRENT RULE
-            </button>
-            
-            {projectRules.length > 0 && (
-              <button 
-                className="btn btn-outline-dark" 
-                style={{ width: '100%', marginTop: '0.5rem', fontSize: '0.75rem' }}
-                onClick={handleApplySavedRules}
-                disabled={isExporting}
-              >
-                APPLY RULES TO THIS PDF
-              </button>
-            )}
           </div>
 
           <div className="sidebar-footer" style={{ padding: '0.75rem' }}>
             <button 
               className="btn btn-primary-bright" 
-              style={{ width: '100%', backgroundColor: 'var(--green-deep)', fontWeight: 'bold', fontSize: '0.9rem', padding: '0.6rem' }}
-              disabled={(projectRules.length === 0 && !searchQuery.trim()) || isExporting}
+              style={{ width: '100%', backgroundColor: 'var(--green-deep)', fontWeight: 'bold', fontSize: '0.9rem', padding: '0.6rem', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px' }}
+              disabled={(projectRules.length === 0 && !searchQuery.trim() && referenceImages.length === 0) || isExporting}
               onClick={handleApplyToAllPdfs}
             >
-              {isExporting ? "Processing..." : "APPLY"}
+              <Shield size={16} />
+              {isExporting ? "Processing..." : "APPLY RULES"}
             </button>
           </div>
         </aside>
@@ -523,8 +1295,50 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
 
           <div className="pdf-container">
             {doc ? (
-              <div className="pdf-page-wrapper" style={{ transform: `scale(${zoomScale})`, transformOrigin: 'top center' }}>
+              <div className="pdf-page-wrapper" style={{ position: 'relative', transformOrigin: 'top center' }}>
                 <canvas ref={canvasRef} className="pdf-canvas shadow-lg"></canvas>
+                {/* Visual overlays for detected images */}
+                {searchResults.filter(r => r.pageNumber === activePage && (r.type === 'image-detected' || r.type === 'image-match')).map(match => {
+                  const isSelected = selectedMatchIds.has(match.matchId);
+                  
+                  return (
+                    <div
+                      key={match.matchId}
+                      onClick={() => {
+                        setSelectedMatchIds(prev => {
+                          const next = new Set(prev);
+                          if (next.has(match.matchId)) next.delete(match.matchId);
+                          else next.add(match.matchId);
+                          return next;
+                        });
+                      }}
+                      style={{
+                        position: 'absolute',
+                        left: `${match.pdfX * zoomScale}px`,
+                        top: `${(match.pageHeight - match.pdfY - match.pdfHeight) * zoomScale}px`,
+                        width: `${match.pdfWidth * zoomScale}px`,
+                        height: `${match.pdfHeight * zoomScale}px`,
+                        border: isSelected ? '2px solid var(--green-primary)' : '2px dashed rgba(255, 0, 0, 0.7)',
+                        backgroundColor: isSelected ? 'rgba(15, 157, 88, 0.2)' : 'rgba(255, 0, 0, 0.1)',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'flex-start',
+                        justifyContent: 'flex-start',
+                        zIndex: 10
+                      }}
+                    >
+                       <span style={{ 
+                         background: isSelected ? 'var(--green-primary)' : 'rgba(255,0,0,0.7)', 
+                         color: 'white', 
+                         fontSize: `${10 * zoomScale}px`, 
+                         padding: '2px 4px', 
+                         fontWeight: 'bold' 
+                       }}>
+                         {isSelected ? 'SELECTED' : (match.type === 'image-match' ? (match.refImageName ? `REF: ${match.refImageName}` : 'REFERENCE MATCH') : 'IMAGE DETECTED')}
+                       </span>
+                    </div>
+                  );
+                })}
               </div>
             ) : (
               <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#888' }}>
@@ -560,6 +1374,230 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
               />
               <button className="clear-btn" onClick={() => setSearchQuery('')}>⊗</button>
             </div>
+            
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '0.4rem', minHeight: '22px' }}>
+              <span style={{ fontSize: '0.7rem', color: '#666' }}>
+                {searchQuery.trim() ? `${searchResults.length} match${searchResults.length === 1 ? '' : 'es'} found` : ''}
+              </span>
+              {searchQuery.trim() && (
+                <button
+                  className="btn btn-outline-dark btn-xs"
+                  style={{ fontSize: '0.65rem', padding: '2px 8px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '4px' }}
+                  onClick={async () => {
+                    await saveCurrentRulesIfNotExists();
+                  }}
+                  disabled={projectRules.some(r => r.type !== 'image' && r.query && r.query.toLowerCase() === searchQuery.trim().toLowerCase())}
+                >
+                  <Shield size={10} />
+                  {projectRules.some(r => r.type !== 'image' && r.query && r.query.toLowerCase() === searchQuery.trim().toLowerCase())
+                    ? "✓ SAVED IN RULES"
+                    : "+ SAVE AS RULE"}
+                </button>
+              )}
+            </div>
+            
+            <div className="section-label" style={{ marginTop: '0.75rem' }}>IMAGE MATCH & PROTECT</div>
+            <div style={{ marginTop: '0.5rem', marginBottom: '0.5rem' }}>
+              <input 
+                type="file" 
+                accept="image/*" 
+                ref={refImageInputRef}
+                style={{ display: 'none' }}
+                onChange={handleReferenceImageUpload}
+                multiple
+              />
+              <button 
+                className="btn btn-secondary-light" 
+                style={{ 
+                  width: '100%', 
+                  fontSize: '0.75rem', 
+                  minHeight: '38px', 
+                  padding: '0 12px',
+                  display: 'flex', 
+                  justifyContent: 'center', 
+                  alignItems: 'center', 
+                  border: '1px solid var(--green-primary)', 
+                  gap: '6px',
+                  fontWeight: 600
+                }}
+                onClick={() => refImageInputRef.current?.click()}
+                disabled={isExtractingML}
+                title={referenceImages.length > 0 ? "Add another reference image" : "Upload reference image"}
+              >
+                {isExtractingML ? (
+                  <>
+                    <RefreshCw size={14} className="spin mr-1" />
+                    EXTRACTING ML FEATURES...
+                  </>
+                ) : (
+                  <>
+                    {referenceImages.length > 0 ? <Plus size={14} /> : <ImageIcon size={14} />}
+                    {referenceImages.length > 0 ? "ADD ANOTHER REFERENCE IMAGE" : "UPLOAD REFERENCE IMAGE"}
+                  </>
+                )}
+              </button>
+            </div>
+
+            {referenceImages.length > 0 && (
+              <div style={{ marginTop: '0.5rem', marginBottom: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '0.68rem', fontWeight: 700, color: 'var(--neutral-gray)', letterSpacing: '0.02em' }}>
+                    REFERENCE IMAGES ({referenceImages.length})
+                  </span>
+                  {referenceImages.length > 1 && (
+                    <div style={{ display: 'flex', gap: '4px' }}>
+                      <button
+                        onClick={() => setSelectedRefImageId(selectedRefImageId === 'all' ? referenceImages[0].id : 'all')}
+                        style={{
+                          background: selectedRefImageId === 'all' ? 'var(--green-deep)' : '#f0f0f0',
+                          color: selectedRefImageId === 'all' ? '#fff' : '#666',
+                          border: 'none',
+                          borderRadius: '10px',
+                          padding: '2px 8px',
+                          fontSize: '0.62rem',
+                          fontWeight: 700,
+                          cursor: 'pointer'
+                        }}
+                      >
+                        {selectedRefImageId === 'all' ? '✓ ALL ACTIVE' : 'SELECT ALL'}
+                      </button>
+                      <button
+                        onClick={clearAllReferenceImages}
+                        style={{
+                          background: 'none',
+                          color: '#e53935',
+                          border: 'none',
+                          fontSize: '0.62rem',
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                          padding: '2px 4px'
+                        }}
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: referenceImages.length === 1 ? '1fr' : 'repeat(2, 1fr)', gap: '0.5rem' }}>
+                  {referenceImages.map((refImg) => {
+                    const isSelected = selectedRefImageId === refImg.id || selectedRefImageId === 'all';
+                    const matchesCount = refImageMatchesCounts[refImg.id] || 0;
+
+                    return (
+                      <div
+                        key={refImg.id}
+                        onClick={() => {
+                          setSelectedRefImageId(refImg.id);
+                          if ((refImageMatchesCounts[refImg.id] || 0) === 0 && pdfDocument) {
+                            scanDocumentForReferenceImages(pdfDocument, [refImg]);
+                          }
+                        }}
+                        style={{
+                          position: 'relative',
+                          border: isSelected ? '2px solid var(--green-primary)' : '1px solid rgba(0,0,0,0.12)',
+                          backgroundColor: isSelected ? 'rgba(15, 157, 88, 0.08)' : '#fafafa',
+                          borderRadius: '6px',
+                          padding: '6px',
+                          cursor: 'pointer',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          transition: 'all 0.15s ease',
+                          boxShadow: isSelected ? '0 2px 4px rgba(15, 157, 88, 0.15)' : 'none'
+                        }}
+                        title="Click to select this reference image to match & protect"
+                      >
+                        {isSelected && (
+                          <div style={{
+                            position: 'absolute',
+                            top: '-6px',
+                            left: '-6px',
+                            backgroundColor: 'var(--green-primary)',
+                            color: '#fff',
+                            borderRadius: '50%',
+                            width: '16px',
+                            height: '16px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '10px',
+                            fontWeight: 'bold',
+                            zIndex: 3
+                          }}>
+                            ✓
+                          </div>
+                        )}
+                        <button
+                          onClick={(e) => handleSaveImageAsRule(refImg, e)}
+                          style={{
+                            position: 'absolute',
+                            top: '4px',
+                            left: isSelected ? '18px' : '4px',
+                            background: projectRules.some(r => r.type === 'image' && (r.refImageId === refImg.id || r.query === refImg.name)) ? 'var(--green-deep)' : 'rgba(0,0,0,0.5)',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '4px',
+                            padding: '1px 5px',
+                            fontSize: '9px',
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '3px',
+                            cursor: 'pointer',
+                            zIndex: 2,
+                            fontWeight: 'bold'
+                          }}
+                          title={projectRules.some(r => r.type === 'image' && (r.refImageId === refImg.id || r.query === refImg.name)) ? "Saved to Rules!" : "Save image as a rule"}
+                        >
+                          <Shield size={9} />
+                          {projectRules.some(r => r.type === 'image' && (r.refImageId === refImg.id || r.query === refImg.name)) ? "RULE" : "+ RULE"}
+                        </button>
+                        <div style={{ width: '100%', height: referenceImages.length === 1 ? '70px' : '52px', display: 'flex', justifyContent: 'center', alignItems: 'center', background: '#fff', borderRadius: '4px', overflow: 'hidden', border: '1px solid rgba(0,0,0,0.06)' }}>
+                          <img src={refImg.preview} alt={refImg.name} style={{ maxHeight: '100%', maxWidth: '100%', objectFit: 'contain' }} />
+                        </div>
+                        <div style={{ marginTop: '4px', width: '100%', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span style={{ fontSize: '0.68rem', fontWeight: 600, color: 'var(--neutral-dark)', maxWidth: '65px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {refImg.name}
+                          </span>
+                          <span style={{
+                            fontSize: '0.62rem',
+                            fontWeight: 700,
+                            padding: '1px 5px',
+                            borderRadius: '10px',
+                            backgroundColor: matchesCount > 0 ? 'var(--green-soft)' : '#e8e8e8',
+                            color: matchesCount > 0 ? 'var(--green-deep)' : '#777'
+                          }}>
+                            {matchesCount} {matchesCount === 1 ? 'match' : 'matches'}
+                          </span>
+                        </div>
+                        <button
+                          onClick={(e) => handleRemoveReferenceImage(refImg.id, e)}
+                          style={{
+                            position: 'absolute',
+                            top: '4px',
+                            right: '4px',
+                            background: 'rgba(0,0,0,0.5)',
+                            color: 'white',
+                            border: 'none',
+                            borderRadius: '50%',
+                            width: '18px',
+                            height: '18px',
+                            display: 'flex',
+                            justifyContent: 'center',
+                            alignItems: 'center',
+                            cursor: 'pointer',
+                            zIndex: 2
+                          }}
+                          title="Remove reference image"
+                        >
+                          <X size={10} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="matches-summary">
@@ -603,14 +1641,53 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
               );
             })}
 
-            {searchResults.length === 0 && searchQuery && (
+            {searchResults.length === 0 && searchQuery && referenceImages.length === 0 && (
               <div style={{ padding: '1rem', color: '#888', textAlign: 'center' }}>
                 No matches found for "{searchQuery}".
               </div>
             )}
-            {!searchQuery && searchResults.length === 0 && (
+            {searchResults.length === 0 && referenceImages.length > 0 && !searchQuery && (
               <div style={{ padding: '1rem', color: '#888', textAlign: 'center' }}>
-                Enter text to search for sensitive entities.
+                No matches found for selected reference image{selectedRefImageId === 'all' ? 's' : ''}.
+                <div style={{ marginTop: '0.5rem', fontSize: '0.65rem' }}>
+                  Select another reference image or click "ADD ANOTHER REFERENCE IMAGE" to test with another version/crop.
+                </div>
+                {pdfDocument && (
+                  <button
+                    onClick={() => {
+                      const targetRefs = (selectedRefImageId && selectedRefImageId !== 'all')
+                        ? referenceImages.filter(img => img.id === selectedRefImageId)
+                        : referenceImages;
+                      scanDocumentForReferenceImages(pdfDocument, targetRefs);
+                    }}
+                    disabled={isExtractingML}
+                    style={{
+                      marginTop: '0.75rem',
+                      background: '#f0fdf4',
+                      color: 'var(--green-deep)',
+                      border: '1px solid var(--green-primary)',
+                      borderRadius: '4px',
+                      padding: '4px 12px',
+                      fontSize: '0.72rem',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '4px'
+                    }}
+                  >
+                    <Search size={12} /> {isExtractingML ? 'Scanning...' : 'Re-scan Document for Matches'}
+                  </button>
+                )}
+              </div>
+            )}
+            {!searchQuery && referenceImages.length === 0 && searchResults.length === 0 && (
+              <div style={{ padding: '1rem', color: '#888', textAlign: 'center' }}>
+                Enter text or upload image to search for sensitive entities.
+                <div style={{ marginTop: '0.5rem', fontSize: '0.65rem' }}>
+                  Diagnostics: {documentTextItems.filter(i => i.type === 'image').length} images found in PDF. 
+                  ({documentTextItems.filter(i => i.type === 'image' && i.hash).length} successfully hashed)
+                </div>
               </div>
             )}
           </div>
@@ -671,7 +1748,7 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
                 className="btn btn-secondary-light footer-btn" 
                 disabled={selectedMatchIds.size === 0 || isExporting}
                 onClick={async () => {
-                  await saveQueryAsRuleIfNotExists();
+                  await saveCurrentRulesIfNotExists();
                   handleApplyRedactions(searchResults.filter(r => selectedMatchIds.has(r.matchId)));
                 }}
               >
@@ -681,7 +1758,7 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
                 className="btn btn-primary footer-btn" 
                 disabled={searchResults.length === 0 || isExporting}
                 onClick={async () => {
-                  await saveQueryAsRuleIfNotExists();
+                  await saveCurrentRulesIfNotExists();
                   handleApplyRedactions(searchResults);
                 }}
               >
@@ -692,7 +1769,7 @@ const EditorWorkspace = ({ document: doc, projectId, projectRules, reloadRules }
             <button 
               className="btn btn-primary-bright footer-btn" 
               style={{ width: '100%', marginTop: '0.5rem', backgroundColor: 'var(--green-deep)' }}
-              disabled={(projectRules.length === 0 && !searchQuery.trim()) || isExporting}
+              disabled={(projectRules.length === 0 && !searchQuery.trim() && referenceImages.length === 0) || isExporting}
               onClick={handleApplyToAllPdfs}
             >
               {isExporting ? "Processing..." : "Apply to all PDFs"}

@@ -10,7 +10,14 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@tensorflow-models/coco-ssd": "^2.2.3",
+    "@tensorflow-models/mobilenet": "^2.1.1",
+    "@tensorflow/tfjs": "^4.22.0",
+    "@tensorflow/tfjs-backend-cpu": "^4.22.0",
+    "@tensorflow/tfjs-backend-webgl": "^4.22.0",
+    "image-hash": "^7.0.1",
     "lucide-react": "^1.47.0",
+    "opencv.js": "^1.2.1",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^6.3.289",
     "react": "^19.2.8",
